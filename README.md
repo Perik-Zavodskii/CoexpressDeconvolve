@@ -5,3 +5,4 @@
  Citation:
  Perik-Zavodskii, R., & Perik-Zavodskaia, O. (2025). StarMap For Visum SD. Zenodo. https://doi.org/10.5281/zenodo.14881191
 
+![StarMap GitHub](https://github.com/user-attachments/assets/46b0543c-534c-4aad-9648-dcef2a1ba166)
