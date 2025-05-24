@@ -1,4 +1,4 @@
-# StarMap For Visum SD
+# StarMapDeconvolve
 
  Perform Visium Standard Definition (SD) spot deconvolution into putative single cells using distance-based gene clustering and cell type formulation.
 
