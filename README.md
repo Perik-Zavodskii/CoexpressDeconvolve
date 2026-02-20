@@ -24,7 +24,6 @@ Your Data: Standard 10x SpaceRanger output (specifically the filtered_feature_bc
 2. Installation
 Install the necessary Python dependencies:
 
-Bash
 pip install h5py tqdm numpy pandas scipy scikit-learn umap-learn
 
 **Usage** 
