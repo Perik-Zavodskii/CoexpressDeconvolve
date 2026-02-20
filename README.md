@@ -8,7 +8,7 @@ _Reference-Free_: Operates without the need for matched scRNA-seq atlases.
 
 _Expression Reconstruction_: Recovers the underlying transcriptional identity of cells within a spot.
 
-_Standard Output_: Generates feature-barcode matrices (H5 format) compatible with downstream tools like Seurat.
+_Standard Output_: Generates feature-barcode matrices (.h5 format) compatible with downstream tools like Seurat.
 
 **Getting Started**
 1. Requirements
@@ -19,7 +19,7 @@ codeconv.py: The core library.
 
 codeconv_config.json: The configuration file containing universal single-cell parameters and housekeeping gene standards.
 
-Your Data: Standard 10x SpaceRanger output (specifically the filtered_feature_bc_matrix.h5 and the "spatial" folder).
+Your Data: Standard 10x SpaceRanger output (specifically the filtered_feature_bc_matrix (folder or .h5 file) and the "spatial" folder).
 
 2. Installation
 
