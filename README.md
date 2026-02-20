@@ -56,6 +56,6 @@ The notebooks guide you through the 9-step pipeline:
 
 **Downstream Analysis**
 
-The output folder will contain a new filtered_feature_bc_matrix.h5. You can load this directly into Seurat using Load10X_Spatial() to perform clustering, trajectory inference, or cell-cell communication analysis as if you had single-cell resolution.
+The output folder will contain a new filtered_feature_bc_matrix.h5. You can load this directly into Seurat using Load10X_Spatial() via the "Seurat Spatial" notebook to perform clustering, trajectory inference, or cell-cell communication analysis as if you had single-cell resolution.
 
 ![Figure 6 copy](https://github.com/user-attachments/assets/7dab151f-4c59-408b-88a0-689b108b5e95)
