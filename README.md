@@ -48,14 +48,14 @@ The notebooks guide you through the 9-step pipeline:
 
 6. Deconvolution: Training the model and projecting topics to the whole transcriptome.
 
-7. Sampling: Generating discrete in silico single cells.
+7. Sampling: Generating single-cell-like expression profiles.
 
-8. Spatial: Placing reconstructed cells within the physical spot boundaries.
+8. Spatial: Placing reconstructed single-cell-like expression profiles within their physical spot boundaries.
 
 9. Export: Saving results in a 10x-compatible format.
 
 **Downstream Analysis**
 
-The output folder will contain a new filtered_feature_bc_matrix.h5. You can load this directly into Seurat using Load10X_Spatial() via the "Seurat Spatial" notebook to perform clustering or cell-cell communication analysis as if you had single-cell resolution.
+The output folder will contain a new filtered_feature_bc_matrix.h5 and "spatial" folder. You can load this directly into Seurat using Load10X_Spatial(), e.g. via the "Seurat Spatial" notebook to perform clustering or cell-cell communication analysis as if you had single-cell resolution.
 
 ![Figure 6 copy](https://github.com/user-attachments/assets/7dab151f-4c59-408b-88a0-689b108b5e95)
