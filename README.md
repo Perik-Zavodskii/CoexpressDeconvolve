@@ -11,6 +11,7 @@ Standard Output: Generates feature-barcode matrices (H5 format) compatible with 
 
 **Getting Started**
 1. Requirements
+
 To run the pipeline, ensure you have the following files in your working directory:
 
 codeconv.py: The core library.
@@ -20,6 +21,7 @@ codeconv_config.json: The configuration file containing universal single-cell pa
 Your Data: Standard 10x SpaceRanger output (specifically the filtered_feature_bc_matrix.h5 and the "spatial" folder).
 
 2. Installation
+
 Install the necessary Python dependencies:
 
 pip install h5py tqdm numpy pandas scipy scikit-learn umap-learn
