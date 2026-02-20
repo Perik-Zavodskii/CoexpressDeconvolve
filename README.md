@@ -28,9 +28,9 @@ pip install h5py tqdm numpy pandas scipy scikit-learn umap-learn
 
 Run the tool by using the provided Jupyter Notebooks. Choose the version corresponding to your species:
 
-For Human data: Open and run CoexpressDeconvolve.ipynb
+For Human data: Open and run CoexpressDeconvolve Hs.ipynb
 
-For Mouse data: Open and run CoexpressDeconvolve_Mm.ipynb
+For Mouse data: Open and run CoexpressDeconvolve Mm.ipynb
 
 The notebooks guide you through the 9-step pipeline:
 
