@@ -3,6 +3,7 @@
 CoexpressDeconvolve is a computational framework designed to resolve the multiple cell per spot problem inherent in spot-based spatial transcriptomics (such as 10x Genomics Visium). Unlike traditional deconvolution methods that only provide cell-type proportions, this tool reconstructs high-fidelity, whole-transcriptome gene expression profiles for individual cell types directly from mixed spatial signals without requiring an external single-cell RNA-seq reference.
 
 **Key Features**
+
 Reference-Free: Operates without the need for matched scRNA-seq atlases.
 
 Expression Reconstruction: Recovers the underlying transcriptional identity of cells within a spot.
