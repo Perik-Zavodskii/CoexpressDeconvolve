@@ -4,11 +4,11 @@ CoexpressDeconvolve is a computational framework designed to resolve the multipl
 
 **Key Features**
 
-Reference-Free: Operates without the need for matched scRNA-seq atlases.
+_Reference-Free_: Operates without the need for matched scRNA-seq atlases.
 
-Expression Reconstruction: Recovers the underlying transcriptional identity of cells within a spot.
+_Expression Reconstruction_: Recovers the underlying transcriptional identity of cells within a spot.
 
-Standard Output: Generates feature-barcode matrices (H5 format) compatible with downstream tools like Seurat.
+_Standard Output_: Generates feature-barcode matrices (H5 format) compatible with downstream tools like Seurat.
 
 **Getting Started**
 1. Requirements
