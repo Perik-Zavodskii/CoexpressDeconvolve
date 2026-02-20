@@ -7,15 +7,13 @@ Reference-Free: Operates without the need for matched scRNA-seq atlases.
 
 Expression Reconstruction: Recovers the underlying transcriptional identity of cells within a spot.
 
-Absolute Abundance: Uses housekeeping gene calibration to approximate cell counts per spot.
-
 Standard Output: Generates feature-barcode matrices (H5 format) compatible with downstream tools like Seurat.
 
 **Getting Started**
 1. Requirements
 To run the pipeline, ensure you have the following files in your working directory:
 
-codeconv.py: The core library containing the sampling engine and manifold projection logic.
+codeconv.py: The core library.
 
 codeconv_config.json: The configuration file containing universal single-cell parameters and housekeeping gene standards.
 
