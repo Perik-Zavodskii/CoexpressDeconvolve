@@ -43,7 +43,7 @@ The notebooks guide you through the 9-step pipeline:
 
 3. Feature Selection: Filtering noise and identifying Highly Variable Genes (HVGs).
 
-4. Manifold Construction: Building the gene co-expression topology.
+4. Manifold Construction: Building the spatial gene co-expression topology.
 
 5. K-Sweep: Optimizing the number of latent topics.
 
