@@ -32,9 +32,9 @@ Install the necessary Python dependencies:
 
 Run the tool by using the provided Jupyter Notebooks. Choose the version corresponding to your species:
 
-For Human data: Open and run CoexpressDeconvolve Hs.ipynb
+For Human data: use `CoexpressDeconvolve Hs.ipynb`
 
-For Mouse data: Open and run CoexpressDeconvolve Mm.ipynb
+For Mouse data: use `CoexpressDeconvolve Mm.ipynb`
 
 The notebooks guide you through the 9-step pipeline:
 
@@ -58,6 +58,6 @@ The notebooks guide you through the 9-step pipeline:
 
 ## Downstream Analysis
 
-The output folder will contain a new filtered_feature_bc_matrix.h5 and "spatial" folder. You can load this directly into Seurat using Load10X_Spatial(), e.g. via the "Seurat Spatial" notebook to perform clustering or cell-cell communication analysis as if you had single-cell resolution.
+The output folder will contain a new `filtered_feature_bc_matrix.h5` and `spatial` folder. You can load this directly into Seurat using `Load10X_Spatial()`, e.g. via the `Seurat Spatial.ipynb` notebook to perform clustering or cell-cell communication analysis as if you had single-cell resolution.
 
 ![Figure 6 copy](https://github.com/user-attachments/assets/7dab151f-4c59-408b-88a0-689b108b5e95)
