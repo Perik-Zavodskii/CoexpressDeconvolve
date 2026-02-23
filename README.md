@@ -20,7 +20,7 @@ To run the pipeline, ensure you have the following files in your working directo
 
 `codeconv_config.json`: The configuration file containing universal single-cell parameters and housekeeping gene standards.
 
-`filtered_feature_bc_matrix.hp5` and `spatial` folder: Your Data.
+`filtered_feature_bc_matrix.h5` and `spatial` folder: Your Data.
 
 2. Installation
 
