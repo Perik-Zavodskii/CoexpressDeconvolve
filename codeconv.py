@@ -1,27 +1,32 @@
+# CoexpressDeconvolve Main Module
+
 import os
 import re
 import json
 import gzip
 import shutil
 import time
-import numpy as np
-import pandas as pd
-import scipy.io
-import scipy.sparse as sp
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm.notebook import tqdm
-from sklearn.decomposition import FastICA
-from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.preprocessing import StandardScaler
-from sklearn.preprocessing import normalize
-from scipy.spatial.distance import cdist
-import h5py
 
 try:
+    import numpy as np
+    import pandas as pd
+    import scipy.io
+    import scipy.sparse as sp
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from tqdm.notebook import tqdm
+    from sklearn.decomposition import FastICA, LatentDirichletAllocation
+    from sklearn.preprocessing import StandardScaler, normalize
+    from scipy.spatial.distance import cdist
+    import h5py
     import umap
-except ImportError:
-    raise ImportError("Step 4 requires 'umap-learn'. Install via: pip install umap-learn")
+except ImportError as e:
+    missing_pkg = str(e).split()[-1]
+    raise ImportError(
+        f"Missing package: {missing_pkg}. "
+        f"Please install required dependencies via:\n"
+        f"pip install numpy pandas scipy matplotlib seaborn scikit-learn h5py tqdm umap-learn"
+    )
 
 def step1_acquisition_and_anchoring(data_path):
     """
