@@ -410,7 +410,7 @@ def step3_feature_selection(counts, gene_names, species='hs', n_hvg=3000):
     print(f"Step 3 took {duration:.6f} seconds")
     return counts_clean, genes_clean, hvg_data, hvg_names
 
-def step4_gene_manifold(hvg_data, hvg_names, n_components = 100):
+def step4_gene_manifold(counts_clean, genes_clean, n_components = 100):
     """
     Step 4: Gene Manifold Learning via ICA and UMAP.
     
