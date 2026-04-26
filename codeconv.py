@@ -715,7 +715,7 @@ def step4_gene_manifold(
     )
 
 
-# STEP 5: K sweep (per-slice + joint)
+# STEP 5: K sweep (per-slice; joint and heatmap only when multi-slice)
 
 def step5_ksweep(
     hvg_pack: HvgPack,
@@ -726,18 +726,18 @@ def step5_ksweep(
     doc_topic_prior: float = 0.1,
     topic_word_prior: float = 0.01,
 ) -> dict:
-    """Run LDA perplexity sweep per slice and on the joint matrix.
-
-    Two diagnostics:
-      1. Overlaid line plot: K vs perplexity, one line per slice plus 'joint'.
-      2. Heatmap (rows=slices, cols=K) of relative perplexity (per-slice min-max normalized).
+    """Run LDA perplexity sweep per slice. With multiple slices, also runs a joint sweep
+    on the concatenated HVG matrix and shows a relative-perplexity heatmap for cross-slice
+    comparison. Single-slice runs skip the joint sweep and the heatmap (both redundant).
     """
     start_time = time.perf_counter()
     ks = list(range(min_k, max_k + 1, step))
     sweep: Dict[str, List[float]] = {}
 
+    n_slices = len(hvg_pack.hvg_per_slice)
     targets = dict(hvg_pack.hvg_per_slice)
-    targets['_joint'] = hvg_pack.hvg_concat
+    if n_slices > 1:
+        targets['_joint'] = hvg_pack.hvg_concat
 
     for label, X in targets.items():
         n_spots = X.shape[0]
@@ -767,23 +767,23 @@ def step5_ksweep(
             perps.append(lda.perplexity(X_use))
         sweep[label] = perps
 
-    # Plot 1: overlaid line plot
+    # Plot 1: line plot of perplexity vs K
     plt.figure(figsize=(10, 5))
     for label, perps in sweep.items():
-        ls = '-' if label == '_joint' else '-'
         lw = 2.5 if label == '_joint' else 1.5
-        plt.plot(ks, perps, marker='o', markerfacecolor='white', label=label, linewidth=lw, linestyle=ls)
+        plt.plot(ks, perps, marker='o', markerfacecolor='white', label=label, linewidth=lw)
     plt.xlabel("K topics")
     plt.ylabel("Perplexity (lower = better fit)")
-    plt.title("Step 5: K-sweep, per slice + joint")
+    title = "Step 5: K-sweep" + (", per slice + joint" if n_slices > 1 else "")
+    plt.title(title)
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
     plt.show()
 
-    # Plot 2: heatmap of per-slice min-max normalized perplexity
+    # Plot 2: cross-slice heatmap (only meaningful with 2+ slices)
     slice_labels = [k for k in sweep.keys() if k != '_joint']
-    if slice_labels:
+    if len(slice_labels) > 1:
         mat = np.zeros((len(slice_labels), len(ks)))
         for i, lbl in enumerate(slice_labels):
             row = np.array(sweep[lbl], dtype=float)
@@ -792,7 +792,6 @@ def step5_ksweep(
         plt.figure(figsize=(max(8, len(ks) * 0.5), 0.6 * len(slice_labels) + 2))
         sns.heatmap(mat, xticklabels=ks, yticklabels=slice_labels,
                     cmap='viridis_r', annot=False, cbar_kws={'label': 'relative perplexity'})
-        # Mark column with lowest median raw perplexity (across slices) as a guide
         raw_mat = np.array([sweep[lbl] for lbl in slice_labels])
         median_per_k = np.median(raw_mat, axis=0)
         best_k_idx = int(np.argmin(median_per_k))
