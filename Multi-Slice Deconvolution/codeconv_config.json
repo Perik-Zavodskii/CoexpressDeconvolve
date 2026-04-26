@@ -1,0 +1,73 @@
+{
+    "_comment": "Mouse HK values and engine_parameters are placeholders mirroring the human reference. Recalibrate from a mouse scRNA reference before publication-grade runs. The 'other' block is intentionally empty: users targeting non hs/mm organisms must supply their own hk_profiles and engine_parameters.",
+    "min_topic_percentage": 0.05,
+    "species_profiles": {
+        "hs": {
+            "noise_regex": "^MT-|^RP[SL][0-9]+|^LINC|^MIR|^AC[0-9]+",
+            "hk_profiles": {
+                "RPL19": 2.529822467672188,
+                "TUBB": 0.6653868555153559,
+                "EEF1G": 1.409845725236883,
+                "PPIA": 1.4689432838260164,
+                "GAPDH": 1.9870339974714675,
+                "ABCF1": 0.2683943094020617,
+                "SDHA": 0.22436799098809676,
+                "OAZ1": 1.5212192863178522,
+                "G6PD": 0.10922542882001043,
+                "ALAS1": 0.10135028595398016,
+                "GUSB": 0.1690932556829679,
+                "HPRT1": 0.18642984163014426,
+                "POLR2A": 0.36647764940764155,
+                "POLR1B": 0.040193901737717995,
+                "TBP": 0.060567363961918315
+            },
+            "qc_markers": [
+                "CD3E", "CD4", "CD8A", "MS4A1", "CD19", "PTPRC",
+                "HBB", "CD14", "FCGR3A", "CD34", "NCAM1", "JCHAIN",
+                "EPCAM", "KRT18", "COL1A1", "DCN", "PECAM1", "ERBB2"
+            ],
+            "engine_parameters": {
+                "mu": 5483.714684902277,
+                "phi": 0.7002926708915271
+            }
+        },
+        "mm": {
+            "noise_regex": "^mt-|^Rp[sl][0-9]+|^Gm[0-9]+|^Mir|^Rik$",
+            "hk_profiles": {
+                "Rpl19": 2.529822467672188,
+                "Tubb5": 0.6653868555153559,
+                "Eef1g": 1.409845725236883,
+                "Ppia": 1.4689432838260164,
+                "Gapdh": 1.9870339974714675,
+                "Abcf1": 0.2683943094020617,
+                "Sdha": 0.22436799098809676,
+                "Oaz1": 1.5212192863178522,
+                "G6pdx": 0.10922542882001043,
+                "Alas1": 0.10135028595398016,
+                "Gusb": 0.1690932556829679,
+                "Hprt": 0.18642984163014426,
+                "Polr2a": 0.36647764940764155,
+                "Polr1b": 0.040193901737717995,
+                "Tbp": 0.060567363961918315
+            },
+            "qc_markers": [
+                "Cd3e", "Cd4", "Cd8a", "Ms4a1", "Cd19", "Ptprc",
+                "Hbb-bs", "Cd14", "Fcgr3", "Cd34", "Ncam1", "Jchain",
+                "Epcam", "Krt18", "Col1a1", "Dcn", "Pecam1", "Erbb2"
+            ],
+            "engine_parameters": {
+                "mu": 5483.714684902277,
+                "phi": 0.7002926708915271
+            }
+        },
+        "other": {
+            "noise_regex": "",
+            "hk_profiles": {},
+            "qc_markers": [],
+            "engine_parameters": {
+                "mu": 5000.0,
+                "phi": 0.7
+            }
+        }
+    }
+}
