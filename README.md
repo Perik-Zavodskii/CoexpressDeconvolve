@@ -24,7 +24,7 @@ pip install h5py tqdm numpy pandas scipy scikit-learn umap-learn matplotlib seab
 
 ## Usage
 
-Run the tool using the provided Jupyter notebook `CoexpressDeconvolve.ipynb`. Species selection now lives in the config block at the top of the notebook, so a single notebook handles human, mouse, and other organisms:
+Run the tool using the provided Jupyter notebook `CoexpressDeconvolve.ipynb`. Species selection is located in the config block at the top of the notebook and handles human, mouse, and other organisms:
 
 ```python
 visium_path   = "."                          # single slice
