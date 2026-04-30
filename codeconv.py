@@ -252,13 +252,18 @@ def _align_topics(betas: Dict[str, np.ndarray], anchor: Optional[str] = None) ->
 
 
 def _safe_multinomial(rng, n, p):
-    """numpy.random.Generator.multinomial wrapper that tolerates float roundoff.
+    """multinomial sample that tolerates float roundoff.
 
-    numpy strictly checks `pvals[:-1].sum() > 1.0` and raises ValueError on overflow
-    even by a few ULPs. This wrapper renormalizes pvals in float64 and shaves any
-    residual overflow off the largest entry of pvals[:-1].
+    Tries the vanilla call first so well-formed inputs draw bit-for-bit identically
+    to a direct rng.multinomial(n, p) call. Falls back to a clip + normalize + shave
+    pass only when vanilla raises ValueError (numpy strictly checks
+    pvals[:-1].sum() > 1.0 and rejects ULP-level overflow).
     """
     p = np.asarray(p, dtype=np.float64)
+    try:
+        return rng.multinomial(int(n), p)
+    except ValueError:
+        pass
     p = np.clip(p, 0.0, None)
     s = p.sum()
     if s <= 0 or not np.isfinite(s):
@@ -572,11 +577,15 @@ def step3_feature_selection(
         print(f"   [{name}] removed {n_dropped} noise genes; kept {len(genes_kept)}")
 
     # Intersect gene sets
-    sets = [set(sd.genes_clean) for sd in slices.values()]
-    intersected = sorted(set.intersection(*sets)) if len(sets) > 0 else []
-    print(f"\nStep 3: intersected gene set size = {len(intersected)}")
+    if len(slices) == 1:
+        only_name = next(iter(slices.keys()))
+        intersected = list(slices[only_name].genes_clean)
+    else:
+        sets = [set(sd.genes_clean) for sd in slices.values()]
+        intersected = sorted(set.intersection(*sets)) if len(sets) > 0 else []
+    print(f"\nStep 3: gene set size = {len(intersected)}")
     if not intersected:
-        raise ValueError("Empty intersection of slice gene sets after noise filter.")
+        raise ValueError("Empty intersection of slice gene sets!")
 
     # Per-slice expression matrix on the intersected order
     intersected_set = set(intersected)
@@ -657,25 +666,34 @@ def step4_gene_manifold(
     config_path: str,
     n_components: int = 30,
 ) -> Manifold:
-    """ICA + UMAP on the joint intersected-gene matrix to produce a gene manifold.
+    """ICA + UMAP on the gene matrix to produce a gene manifold.
 
-    Every intersected gene gets a 2D coordinate; HVG indices into that coord array
-    are tracked separately for downstream projection.
+    Single slice: uses the slice's counts_clean directly in its native gene order
+    (matches legacy codeconv step4 behavior bit-for-bit modulo upstream tie-breaking).
+    Multi-slice: uses the alphabetical-intersected stacked matrix so all slices share
+    a common gene index space.
     """
     start_time = time.perf_counter()
     species = hvg_pack.species
     profile = _load_config(config_path, species)
     qc_markers = profile.get('qc_markers', [])
 
-    # Build (genes x spots) joint matrix on intersected genes
-    inter_concat_per_slice = []
-    for name, sd in slices.items():
-        gene_to_idx = {g: i for i, g in enumerate(sd.genes_clean)}
-        ord_idx = [gene_to_idx[g] for g in hvg_pack.intersected_genes]
-        inter_concat_per_slice.append(sd.counts_clean[:, ord_idx])
-    inter_concat = sp.vstack(inter_concat_per_slice).tocsr()  # spots x intersected_genes
-
-    print(f"Step 4: building gene manifold over {inter_concat.shape[1]} intersected genes...")
+    n_slices = len(slices)
+    if n_slices == 1:
+        only_name = next(iter(slices.keys()))
+        sd = slices[only_name]
+        inter_concat = sd.counts_clean
+        manifold_genes = list(sd.genes_clean)
+        print(f"Step 4: building gene manifold over {inter_concat.shape[1]} genes (single-slice native order)...")
+    else:
+        inter_concat_per_slice = []
+        for name, sd in slices.items():
+            gene_to_idx = {g: i for i, g in enumerate(sd.genes_clean)}
+            ord_idx = [gene_to_idx[g] for g in hvg_pack.intersected_genes]
+            inter_concat_per_slice.append(sd.counts_clean[:, ord_idx])
+        inter_concat = sp.vstack(inter_concat_per_slice).tocsr()
+        manifold_genes = list(hvg_pack.intersected_genes)
+        print(f"Step 4: building gene manifold over {inter_concat.shape[1]} intersected genes...")
 
     # Transpose: now rows are genes, columns are spots-across-slices
     X_genes = inter_concat.T
@@ -697,8 +715,8 @@ def step4_gene_manifold(
     )
     embedding = reducer.fit_transform(X_ica)
 
-    # HVG positions in the intersected-gene index space
-    inter_index = {g: i for i, g in enumerate(hvg_pack.intersected_genes)}
+    # HVG positions within the manifold's gene index space
+    inter_index = {g: i for i, g in enumerate(manifold_genes)}
     hvg_indices_in_intersected = [inter_index[g] for g in hvg_pack.hvg_names]
 
     # Visualization
@@ -731,7 +749,7 @@ def step4_gene_manifold(
     print(f"Step 4 done in {duration:.2f}s")
     return Manifold(
         embedding=embedding,
-        intersected_genes=list(hvg_pack.intersected_genes),
+        intersected_genes=manifold_genes,
         hvg_indices_in_intersected=hvg_indices_in_intersected,
         species=species,
     )
@@ -1025,7 +1043,10 @@ def step7_sampling_engine(
     low_q_d = _broadcast(low_slice_quality, names, default=False)
 
     out: Dict[str, dict] = {}
-    rng = np.random.default_rng(_SEED)
+    # Use the legacy RandomState (Mersenne Twister) so that multinomial / gamma
+    # draws match the legacy codeconv step7 sequence sample-for-sample under the
+    # same seed. PCG64 (np.random.default_rng) would draw a different sequence.
+    rng = np.random.RandomState(_SEED)
 
     for name in names:
         sd = slices[name]
@@ -1050,16 +1071,21 @@ def step7_sampling_engine(
             if n_total == 0:
                 continue
 
-            # Threshold-and-renormalize theta
-            theta_eff = theta[s].copy()
-            theta_eff[theta_eff < min_topic_percentage] = 0.0
-            tsum = theta_eff.sum()
-            if tsum <= 0:
-                # Spot has no surviving topics; fall back to argmax of original theta
-                theta_eff = np.zeros_like(theta_eff)
-                theta_eff[int(np.argmax(theta[s]))] = 1.0
-                tsum = 1.0
-            theta_eff /= tsum
+            # Threshold-and-renormalize theta. Bypassed entirely when min_topic_percentage<=0
+            # so that legacy single-slice runs see theta_eff identical to theta[s] (no copy,
+            # no float drift from renormalization).
+            if min_topic_percentage > 0:
+                theta_eff = theta[s].copy()
+                theta_eff[theta_eff < min_topic_percentage] = 0.0
+                tsum = theta_eff.sum()
+                if tsum <= 0:
+                    # Spot has no surviving topics; fall back to argmax of original theta
+                    theta_eff = np.zeros_like(theta_eff)
+                    theta_eff[int(np.argmax(theta[s]))] = 1.0
+                    tsum = 1.0
+                theta_eff /= tsum
+            else:
+                theta_eff = theta[s]
 
             topic_dist = _safe_multinomial(rng, n_total, theta_eff)
 
@@ -1099,10 +1125,11 @@ def step7_sampling_engine(
                 count = int(spot_vec[g])
                 p_topic = beta[:, g] * theta_eff
                 if p_topic.sum() == 0:
-                    p_topic = theta_eff.copy()
-                    if p_topic.sum() == 0:
-                        p_topic = np.ones(n_topics) / n_topics
-                p_topic = p_topic / p_topic.sum()
+                    # Match legacy codeconv: uniform fallback when projected beta is zero
+                    # across topics for this gene.
+                    p_topic = np.ones(n_topics) / n_topics
+                else:
+                    p_topic = p_topic / p_topic.sum()
                 umi_per_topic = _safe_multinomial(rng, count, p_topic)
 
                 for k in range(n_topics):
