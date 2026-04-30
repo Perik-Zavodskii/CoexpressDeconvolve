@@ -251,6 +251,28 @@ def _align_topics(betas: Dict[str, np.ndarray], anchor: Optional[str] = None) ->
     return aligned
 
 
+def _safe_multinomial(rng, n, p):
+    """numpy.random.Generator.multinomial wrapper that tolerates float roundoff.
+
+    numpy strictly checks `pvals[:-1].sum() > 1.0` and raises ValueError on overflow
+    even by a few ULPs. This wrapper renormalizes pvals in float64 and shaves any
+    residual overflow off the largest entry of pvals[:-1].
+    """
+    p = np.asarray(p, dtype=np.float64)
+    p = np.clip(p, 0.0, None)
+    s = p.sum()
+    if s <= 0 or not np.isfinite(s):
+        out = np.zeros(len(p), dtype=int)
+        out[0] = int(n)
+        return out
+    p = p / s
+    overflow = p[:-1].sum() - 1.0
+    if overflow > 0:
+        idx = int(np.argmax(p[:-1]))
+        p[idx] = max(0.0, p[idx] - overflow)
+    return rng.multinomial(int(n), p)
+
+
 # STEP 1: load
 
 def step1_acquisition_and_anchoring(visium_path) -> Dict[str, SliceData]:
@@ -821,15 +843,19 @@ def step6_final_deconvolution(
     topic_word_prior: float = 0.01,
     e_step_iters: int = 50,
 ) -> Model:
-    """Per-slice LDA, Hungarian topic alignment, mean-consensus beta, per-slice theta refit
-    via variational E-step with frozen consensus beta, then per-slice manifold-guided
-    projection of consensus beta to each slice's full genes_clean.
+    """LDA fit per slice. With multiple slices, topics are aligned across slices via
+    Hungarian matching on cosine similarity of betas, a mean-consensus beta is built,
+    and per-slice theta is refit against the frozen consensus beta via variational E-step.
+    With a single slice, the LDA beta is the model directly. Per-slice manifold-guided
+    projection then extends consensus topics to each slice's full genes_clean.
     """
     start_time = time.perf_counter()
+    n_slices = len(slices)
     n_hvg = len(hvg_pack.hvg_names)
-    print(f"Step 6: per-slice LDA fit, K={n_topics}")
+    print(f"Step 6: LDA fit, K={n_topics}   ({n_slices} slice{'s' if n_slices > 1 else ''})")
 
     per_slice_betas_unaligned: Dict[str, np.ndarray] = {}
+    per_slice_thetas_lda: Dict[str, np.ndarray] = {}
     for name in slices.keys():
         X = hvg_pack.hvg_per_slice[name]
         print(f"   [{name}] LDA on {X.shape[0]} spots")
@@ -843,80 +869,124 @@ def step6_final_deconvolution(
             doc_topic_prior=doc_topic_prior,
             topic_word_prior=topic_word_prior,
         )
-        lda.fit(X)
+        theta_lda = lda.fit_transform(X)
         beta = lda.components_ / lda.components_.sum(axis=1, keepdims=True)
         per_slice_betas_unaligned[name] = beta
+        per_slice_thetas_lda[name] = theta_lda
 
-    # Hungarian alignment to first slice
-    print("Step 6: Hungarian alignment of topics across slices")
-    aligned_betas = _align_topics(per_slice_betas_unaligned)
+    if n_slices > 1:
+        # Multi-slice path: align topics, build consensus beta, refit theta with frozen beta
+        print("Step 6: Hungarian alignment of topics across slices")
+        aligned_betas = _align_topics(per_slice_betas_unaligned)
 
-    # Mean-consensus beta (on HVG, K x n_hvg)
-    print("Step 6: building consensus beta (mean across aligned slices)")
-    beta_stack = np.stack([aligned_betas[n] for n in slices.keys()], axis=0)
-    beta_consensus = beta_stack.mean(axis=0)
-    beta_consensus = beta_consensus / beta_consensus.sum(axis=1, keepdims=True)
+        print("Step 6: building consensus beta (mean across aligned slices)")
+        beta_stack = np.stack([aligned_betas[n] for n in slices.keys()], axis=0)
+        beta_consensus = beta_stack.mean(axis=0)
+        beta_consensus = beta_consensus / beta_consensus.sum(axis=1, keepdims=True)
 
-    # Per-slice theta refit via variational E-step with frozen consensus beta
-    print(f"Step 6: per-slice theta refit (variational E-step, max_iter={e_step_iters})")
-    for name, sd in slices.items():
-        X = hvg_pack.hvg_per_slice[name]
-        theta = _variational_e_step(X, beta_consensus, alpha=doc_topic_prior, max_iter=e_step_iters)
-        sd.theta = theta
-        print(f"   [{name}] theta {theta.shape}")
+        print(f"Step 6: per-slice theta refit (variational E-step, max_iter={e_step_iters})")
+        for name, sd in slices.items():
+            X = hvg_pack.hvg_per_slice[name]
+            theta = _variational_e_step(X, beta_consensus, alpha=doc_topic_prior, max_iter=e_step_iters)
+            sd.theta = theta
+            print(f"   [{name}] theta {theta.shape}")
+        # Multi-slice projection: per-slice with cosine fallback for slice-specific genes
+        print("Step 6: projecting topics to full genes_clean per slice")
+        inter_index = {g: i for i, g in enumerate(manifold.intersected_genes)}
+        hvg_idx_in_intersected = manifold.hvg_indices_in_intersected
+        hvg_coords_manifold = manifold.embedding[hvg_idx_in_intersected]
 
-    # Per-slice manifold-guided projection of consensus beta -> slice's genes_clean
-    print("Step 6: per-slice projection to full genes_clean")
-    inter_index = {g: i for i, g in enumerate(manifold.intersected_genes)}
-    hvg_idx_in_intersected = manifold.hvg_indices_in_intersected
-    hvg_coords = manifold.embedding[hvg_idx_in_intersected]
+        per_slice_betas_full: Dict[str, np.ndarray] = {}
+        for name, sd in slices.items():
+            genes_s = sd.genes_clean
+            n_genes_s = len(genes_s)
+            beta_full = np.zeros((n_topics, n_genes_s))
 
-    per_slice_betas_full: Dict[str, np.ndarray] = {}
-    for name, sd in slices.items():
+            slice_gene_to_idx = {g: i for i, g in enumerate(genes_s)}
+            hvg_idx_in_slice = [slice_gene_to_idx[g] for g in hvg_pack.hvg_names]
+
+            norm_all = normalize(sd.counts_clean.T, axis=1)
+            norm_hvg = normalize(sd.counts_clean[:, hvg_idx_in_slice].T, axis=1)
+            sim_full = norm_all @ norm_hvg.T
+
+            for i, g in enumerate(genes_s):
+                sim_row = sim_full[i].toarray().flatten() if sp.issparse(sim_full) else sim_full[i]
+                if g in inter_index:
+                    gi = inter_index[g]
+                    g_pos = manifold.embedding[gi]
+                    dists = np.linalg.norm(hvg_coords_manifold - g_pos, axis=1)
+                    neighbors = np.argsort(dists)[:k_neighbors]
+                else:
+                    neighbors = np.argsort(-sim_row)[:k_neighbors]
+
+                weights = sim_row[neighbors]
+                if np.max(weights) < min_sim:
+                    continue
+                proj = beta_consensus[:, neighbors] @ weights
+                if proj.sum() > 0:
+                    beta_full[:, i] = proj / proj.sum()
+
+            sd.beta_final = beta_full
+            per_slice_betas_full[name] = beta_full
+            print(f"   [{name}] beta_final {beta_full.shape}")
+
+        # Multi-slice QC: from beta_consensus on HVG (per-slice betas differ, HVG is the shared basis)
+        topic_dict = {}
+        for k in range(n_topics):
+            top_idx = beta_consensus[k].argsort()[::-1][:15]
+            topic_dict[f"Topic_{k}"] = [hvg_pack.hvg_names[i] for i in top_idx]
+        qc_df = pd.DataFrame(topic_dict)
+    else:
+        # Single-slice path mirrors the legacy codeconv step6: LDA fit_transform
+        # gives theta and beta_hvg, then a single cdist-based projection extends
+        # beta to the full genes_clean. QC table is built from the projected beta_final.
+        only_name = next(iter(slices.keys()))
+        sd = slices[only_name]
+        sd.theta = per_slice_thetas_lda[only_name]
+        beta_hvg = per_slice_betas_unaligned[only_name]
+        beta_consensus = beta_hvg
+        print(f"   [{only_name}] theta {sd.theta.shape}")
+
+        print("Step 6: projecting latent topics using UMAP manifold topology")
         genes_s = sd.genes_clean
         n_genes_s = len(genes_s)
-        beta_full = np.zeros((n_topics, n_genes_s))
 
-        # HVG indices within slice's genes_clean (HVG is a subset of intersected, which
-        # is a subset of every slice's genes_clean)
+        # Manifold positions: for a single slice, every gene in genes_clean is in
+        # the intersected set (intersection of one set is itself), so all genes have
+        # manifold coordinates.
+        inter_index = {g: i for i, g in enumerate(manifold.intersected_genes)}
+        hvg_coords_manifold = manifold.embedding[manifold.hvg_indices_in_intersected]
+        all_coords = manifold.embedding[[inter_index[g] for g in genes_s]]
+        dist_matrix = cdist(all_coords, hvg_coords_manifold, metric='euclidean')
+
+        # Cosine similarity in expression space
         slice_gene_to_idx = {g: i for i, g in enumerate(genes_s)}
         hvg_idx_in_slice = [slice_gene_to_idx[g] for g in hvg_pack.hvg_names]
-
-        # Cosine similarity in slice expression space: every gene vs every HVG
         norm_all = normalize(sd.counts_clean.T, axis=1)
         norm_hvg = normalize(sd.counts_clean[:, hvg_idx_in_slice].T, axis=1)
-        sim_full = norm_all @ norm_hvg.T  # (n_genes_s, n_hvg) sparse
+        similarity = norm_all @ norm_hvg.T
 
-        for i, g in enumerate(genes_s):
-            sim_row = sim_full[i].toarray().flatten() if sp.issparse(sim_full) else sim_full[i]
-
-            if g in inter_index:
-                # Manifold-guided neighbors among HVGs
-                gi = inter_index[g]
-                g_pos = manifold.embedding[gi]
-                dists = np.linalg.norm(hvg_coords - g_pos, axis=1)
-                neighbors = np.argsort(dists)[:k_neighbors]
-            else:
-                # Fallback for slice-specific genes: pure expression-cosine neighbors
-                neighbors = np.argsort(-sim_row)[:k_neighbors]
-
-            weights = sim_row[neighbors]
+        beta_final = np.zeros((n_topics, n_genes_s))
+        for i in range(n_genes_s):
+            umap_neighbors_idx = np.argsort(dist_matrix[i])[:k_neighbors]
+            sim_row = similarity[i].toarray().flatten() if sp.issparse(similarity) else similarity[i]
+            weights = sim_row[umap_neighbors_idx]
             if np.max(weights) < min_sim:
                 continue
-            proj = beta_consensus[:, neighbors] @ weights
+            proj = beta_hvg[:, umap_neighbors_idx] @ weights
             if proj.sum() > 0:
-                beta_full[:, i] = proj / proj.sum()
+                beta_final[:, i] = proj / proj.sum()
 
-        sd.beta_final = beta_full
-        per_slice_betas_full[name] = beta_full
-        print(f"   [{name}] beta_final {beta_full.shape}")
+        sd.beta_final = beta_final
+        per_slice_betas_full = {only_name: beta_final}
+        print(f"   [{only_name}] beta_final {beta_final.shape}")
 
-    # QC table: top genes per topic from consensus beta on HVG names
-    topic_dict = {}
-    for k in range(n_topics):
-        top_idx = beta_consensus[k].argsort()[::-1][:15]
-        topic_dict[f"Topic_{k}"] = [hvg_pack.hvg_names[i] for i in top_idx]
-    qc_df = pd.DataFrame(topic_dict)
+        # Single-slice QC: top genes per topic from beta_final on full genes_clean (matches legacy behavior)
+        topic_dict = {}
+        for k in range(n_topics):
+            top_idx = beta_final[k].argsort()[::-1][:15]
+            topic_dict[f"Topic_{k}"] = [genes_s[i] for i in top_idx]
+        qc_df = pd.DataFrame(topic_dict)
 
     duration = time.perf_counter() - start_time
     print(f"Step 6 done in {duration:.2f}s")
@@ -991,7 +1061,7 @@ def step7_sampling_engine(
                 tsum = 1.0
             theta_eff /= tsum
 
-            topic_dist = rng.multinomial(n_total, theta_eff)
+            topic_dist = _safe_multinomial(rng, n_total, theta_eff)
 
             # Inflate rescue for low-quality slices
             if slice_low_q:
@@ -1033,12 +1103,12 @@ def step7_sampling_engine(
                     if p_topic.sum() == 0:
                         p_topic = np.ones(n_topics) / n_topics
                 p_topic = p_topic / p_topic.sum()
-                umi_per_topic = rng.multinomial(count, p_topic)
+                umi_per_topic = _safe_multinomial(rng, count, p_topic)
 
                 for k in range(n_topics):
                     u_count = int(umi_per_topic[k])
                     if u_count > 0 and k in cells_weights:
-                        umi_per_cell = rng.multinomial(u_count, cells_weights[k])
+                        umi_per_cell = _safe_multinomial(rng, u_count, cells_weights[k])
                         for ci, val in enumerate(umi_per_cell):
                             if val > 0:
                                 rows.append(cells_indices[k][ci])
