@@ -409,47 +409,43 @@ def step2_estimate_cell_density(
     species: str,
     min_umi=300,
     anchor_mean_factor=1.0,
+    anchor_blend_alpha=0.6, 
     low_slice_quality=False,
     colormap='hsv',
 ) -> Dict[str, SliceData]:
-    """Estimate per-spot cell counts from HK gene calibration.
+    """Estimate per-spot cell counts from Hybrid HK-UMI calibration.
 
-    Per-slice min_umi and anchor_mean_factor accepted as scalar (broadcast) or dict.
-    low_slice_quality=True (per-slice) enforces a floor of >=1 cell on every spot
-    that passes the UMI gate.
+    Per-slice min_umi, anchor_mean_factor, and alpha accepted as scalar or dict.
+    alpha=1.0 is pure UMI, alpha=0.0 is pure Housekeeping.
     """
     start_time = time.perf_counter()
     profile = _load_config(config_path, species)
     hk_reference = profile['hk_profiles']
-    engine_params = profile['engine_parameters']
+    engine_params = profile.get('engine_parameters', {})
 
     if not hk_reference:
-        raise ValueError(
-            f"Species '{species}' has no hk_profiles in config. "
-            "Provide HK reference values for non-standard organisms."
-        )
+        raise ValueError(f"Species '{species}' has no hk_profiles in config.")
 
     names = list(slices.keys())
     min_umi_d = _broadcast(min_umi, names)
     anchor_d = _broadcast(anchor_mean_factor, names)
+    alpha_d = _broadcast(anchor_blend_alpha, names)
     low_q_d = _broadcast(low_slice_quality, names, default=False)
 
     for name in names:
         sd = slices[name]
         slice_min_umi = min_umi_d[name]
         slice_anchor = anchor_d[name]
+        slice_alpha = alpha_d[name]
         slice_low_q = low_q_d[name]
 
-        print(f"\nStep 2 [{name}]: HK calibration (min_umi={slice_min_umi}, factor={slice_anchor}, low_quality={slice_low_q})")
+        print(f"\nStep 2 [{name}]: Hybrid Calibration (alpha={slice_alpha}, factor={slice_anchor})")
 
         common_hk = [g for g in hk_reference.keys() if g in sd.gene_names]
-        if not common_hk:
-            raise ValueError(f"[{name}] No HK overlap between data and config for species='{species}'")
-        print(f"   {len(common_hk)} HK genes used")
-
         hk_indices = [sd.gene_names.index(g) for g in common_hk]
         ref_values_log = np.array([hk_reference[g] for g in common_hk])
 
+        # 1. Housekeeping Signal (The Biological Anchor)
         safe_total = sd.total_umi.copy()
         safe_total[safe_total == 0] = 1
         hk_counts_raw = sd.counts[:, hk_indices].toarray()
@@ -461,15 +457,28 @@ def step2_estimate_cell_density(
 
         spot_signal_linear = np.expm1(spot_hk_log_means)
         standard_signal_linear = np.expm1(adjusted_standard_log_mean)
-        if standard_signal_linear < 0.001:
-            standard_signal_linear = 0.001
+        if standard_signal_linear < 0.001: standard_signal_linear = 0.001
 
-        raw_n_cells = spot_signal_linear / standard_signal_linear
+        hk_cells = spot_signal_linear / standard_signal_linear
+
+        # 2. Total UMI Signal (The Statistical Stabilizer)
+        # We anchor the UMI-per-cell ratio to the valid HK-estimated spots
+        valid_gate = sd.total_umi >= slice_min_umi
+        if np.any(valid_gate) and np.sum(hk_cells[valid_gate]) > 0:
+            global_umi_per_cell = np.sum(sd.total_umi[valid_gate]) / np.sum(hk_cells[valid_gate])
+        else:
+            global_umi_per_cell = np.mean(sd.total_umi) / 5.0 # Fallback
+            
+        umi_cells = sd.total_umi / global_umi_per_cell
+
+        # 3. The Hybrid Blend (Weighted Geometric Mean)
+        raw_n_cells = (umi_cells ** slice_alpha) * (hk_cells ** (1.0 - slice_alpha))
+        
+        # 4. Discrete Mapping and Filtering
         n_cells = np.round(raw_n_cells).astype(int)
-
         is_low_quality = sd.total_umi < slice_min_umi
         n_cells[is_low_quality] = 0
-        # Low-slice-quality floor: every spot above UMI gate gets at least 1 cell
+        
         if slice_low_q:
             floor_mask = (~is_low_quality) & (n_cells == 0)
             n_cells[floor_mask] = 1
