@@ -11,8 +11,8 @@ Multi-slice handling:
 
 LDA is fit per-slice and topics are aligned across slices by Hungarian matching on
 cosine similarity of betas; the consensus beta is the mean of aligned betas.
-Per-slice theta is then refit against the frozen consensus beta via a hand-rolled
-variational E-step. The gene-coexpression manifold is joint over the intersected
+Per-slice theta is then refit against the frozen consensus beta via a variational E-step.
+The gene-coexpression manifold is joint over the intersected
 gene set; per-slice beta projection extends consensus topics to each slice's full
 cleaned gene list.
 """
@@ -37,7 +37,7 @@ try:
     from sklearn.preprocessing import StandardScaler, normalize
     from scipy.spatial.distance import cdist
     from scipy.optimize import linear_sum_assignment
-    from scipy.special import digamma
+    from scipy.special import digamma, polygamma
     import h5py
     import umap
 except ImportError as e:
@@ -76,20 +76,20 @@ class SliceData:
     coords: np.ndarray
     total_umi: np.ndarray
     scale_factors: dict
-    # filled by step2
+    # filled by Step 2
     n_cells: Optional[np.ndarray] = None
     engine_params: Optional[dict] = None
-    # filled by step3 per-slice (post noise filter, slice-specific)
+    # filled by Step 3 per-slice (post noise filter, slice-specific)
     counts_clean: Optional[sp.csr_matrix] = None
     genes_clean: Optional[List[str]] = None
-    # filled by step6 per-slice
+    # filled by Step 6 per-slice
     theta: Optional[np.ndarray] = None
     beta_final: Optional[np.ndarray] = None
 
 
 @dataclass
 class HvgPack:
-    """Output of step3. Joint HVG selection on the intersected gene set."""
+    """Output of Step 3. Joint overdispersed-gene selection on the intersected gene set."""
     intersected_genes: List[str]
     hvg_names: List[str]
     hvg_per_slice: Dict[str, sp.csr_matrix]
@@ -99,7 +99,7 @@ class HvgPack:
 
 @dataclass
 class Manifold:
-    """Output of step4. Joint manifold on intersected genes."""
+    """Output of Step 4. Joint manifold on intersected genes."""
     embedding: np.ndarray
     intersected_genes: List[str]
     hvg_indices_in_intersected: List[int]
@@ -108,12 +108,40 @@ class Manifold:
 
 @dataclass
 class Model:
-    """Output of step6. Consensus beta + per-slice theta."""
+    """Output of Step 6. Consensus beta + per-slice theta."""
     n_topics: int
     hvg_names: List[str]
     beta_consensus: np.ndarray
     qc_df: pd.DataFrame
     per_slice_betas: Dict[str, np.ndarray]
+    per_slice_stability: Optional[Dict[str, float]] = None
+
+
+@dataclass
+class KSweepResult:
+    """Output of Step 5. Compact repr so notebook auto-display stays one line.
+
+    All metrics remain accessible as attributes for programmatic inspection,
+    custom plotting, or persistence — only the default display is suppressed.
+    """
+    perplexity: Dict[str, Dict[int, float]]
+    rare_topics: Dict[str, Dict[int, int]]
+    alpha_mean: Dict[str, Dict[int, float]]
+    alpha_per_topic: Dict[str, Dict[int, np.ndarray]]
+    perc_rare_thresh: float
+    recommended_k: Dict[str, Dict[str, object]]
+
+    def __repr__(self) -> str:
+        if not self.perplexity:
+            return "KSweepResult(empty)"
+        targets = list(self.perplexity.keys())
+        any_label = targets[0]
+        ks = sorted(self.perplexity[any_label].keys())
+        if ks:
+            k_span = f"K={ks[0]}..{ks[-1]}"
+        else:
+            k_span = "K=[]"
+        return f"KSweepResult(targets={targets}, {k_span})"
 
 
 # Helpers
@@ -276,6 +304,247 @@ def _safe_multinomial(rng, n, p):
         idx = int(np.argmax(p[:-1]))
         p[idx] = max(0.0, p[idx] - overflow)
     return rng.multinomial(int(n), p)
+
+
+def _inv_digamma(y, n_iter: int = 5):
+    """Newton's method for the inverse of the digamma function.
+
+    Initialization rule from Minka, "Estimating a Dirichlet distribution" (2000),
+    Appendix C. Five Newton steps suffice for double precision.
+    """
+    y = np.asarray(y, dtype=float)
+    x = np.where(y >= -2.22, np.exp(y) + 0.5, -1.0 / (y - digamma(1.0)))
+    for _ in range(n_iter):
+        x = x - (digamma(x) - y) / polygamma(1, x)
+    return x
+
+
+def _dirichlet_alpha_mle(
+    theta: np.ndarray,
+    max_iter: int = 200,
+    tol: float = 1e-7,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Estimate an asymmetric Dirichlet alpha from observed proportions.
+
+    Implements Minka's fixed-point iteration (2000, eq. 9). Treats each row of
+    theta as an observed sample from Dir(alpha). The iteration loops
+        alpha_k <- digamma^{-1}( digamma(sum_k alpha_k) + E_d[log theta_{d,k}] )
+    until convergence.
+
+    Used in Step 5 as a post-hoc proxy for the alpha parameter that
+    STdeconvolve's R LDA estimates directly (sklearn fixes doc_topic_prior, so
+    we recover an alpha estimate from the fitted topic distributions instead).
+    A fitted mean alpha < 1 indicates the model retained a sparse Dirichlet
+    prior (each spot dominated by a few topics); values >= 1 mean topics smear
+    across spots, which is the classical "K is too large" signature.
+
+    Parameters
+    ----------
+    theta : (N, K) array of proportions, each row should sum to ~1.
+
+    Returns
+    -------
+    alpha : (K,) array of per-topic concentration parameters.
+    """
+    theta = np.asarray(theta, dtype=float)
+    theta = np.clip(theta, eps, 1.0)
+    log_p_mean = np.mean(np.log(theta), axis=0)
+
+    # Method-of-moments initialization (Minka eq. 23).
+    p_mean = np.mean(theta, axis=0)
+    p_var = np.maximum(np.mean(theta ** 2, axis=0) - p_mean ** 2, eps)
+    s_per_k = (p_mean * (1.0 - p_mean) / p_var) - 1.0
+    s = max(float(np.median(s_per_k)), 0.1)
+    alpha = np.maximum(p_mean * s, 1e-3)
+
+    for _ in range(max_iter):
+        alpha_old = alpha.copy()
+        alpha = _inv_digamma(digamma(alpha.sum()) + log_p_mean)
+        alpha = np.maximum(alpha, 1e-6)
+        if np.max(np.abs(alpha - alpha_old)) < tol:
+            break
+    return alpha
+
+
+def _overdispersed_genes(
+    counts: sp.csr_matrix,
+    n_top: int,
+    poly_deg: int = 3,
+    fit_mask: Optional[np.ndarray] = None,
+):
+    """Select overdispersed genes via mean-variance trend residuals.
+
+    Library-size-normalize counts to 10k, log1p-transform, compute per-gene
+    mean and variance, fit a smoothed polynomial trend log10(var) ~
+    poly(log10(mean)) across genes, and rank genes by the residual above the
+    trend. The top n_top residuals are the overdispersed gene set.
+
+    This mirrors STdeconvolve's restrictCorpus / getOverdispersedGenes: genes
+    whose variance exceeds the global mean-variance relationship are the ones
+    that carry biological signal beyond Poisson sampling noise. Replaces the
+    earlier binned-dispersion-z-score selection inspired by Seurat: more robust
+    to bin-edge effects and closer to the corpus-building procedure LDA-based
+    spatial deconvolution expects.
+
+    Parameters
+    ----------
+    fit_mask : Optional[np.ndarray]
+        Boolean mask of length n_genes. If provided, the polynomial trend is
+        fit using only the genes where fit_mask is True (e.g. to exclude
+        pre-filtered rare or ubiquitous genes), AND ranking is restricted to
+        those same genes. Residuals are still computed for all genes so the
+        diagnostic plot can show filtered-out genes as context.
+
+    Returns
+    -------
+    top_indices : np.ndarray (n_top_eff,)
+        Gene indices sorted by residual, highest first. When fit_mask is given,
+        all returned indices come from the masked-in set.
+    log_mean, log_var, fitted_log_var, residuals : np.ndarray (n_genes,)
+        Diagnostic arrays for plotting.
+    """
+    row_sums = np.array(counts.sum(axis=1)).flatten()
+    row_sums[row_sums == 0] = 1
+    norm = counts.copy().astype(float)
+    norm.data /= np.repeat(row_sums, np.diff(norm.indptr))
+    norm.data *= 10000.0
+    norm.data = np.log1p(norm.data)
+
+    mean_expr = np.array(norm.mean(axis=0)).flatten()
+    sq = norm.copy()
+    sq.data **= 2
+    mean_sq = np.array(sq.mean(axis=0)).flatten()
+    var_expr = np.maximum(mean_sq - mean_expr ** 2, 0.0)
+
+    eps = 1e-10
+    log_mean = np.log10(mean_expr + eps)
+    log_var = np.log10(var_expr + eps)
+    valid = (mean_expr > 0) & (var_expr > 0)
+
+    if fit_mask is not None:
+        fit_mask = np.asarray(fit_mask, dtype=bool)
+        fit_valid = valid & fit_mask
+        rank_pool = fit_valid
+    else:
+        fit_valid = valid
+        rank_pool = valid
+
+    if int(fit_valid.sum()) < poly_deg + 1:
+        # Pathological corpus: fall back to top by raw variance within the pool.
+        n_top_eff = min(n_top, int(rank_pool.sum()) if rank_pool.sum() > 0 else n_top)
+        scores = np.where(rank_pool, var_expr, -np.inf)
+        top = np.argsort(scores)[-n_top_eff:][::-1]
+        fitted = np.full_like(log_var, np.nan)
+        return top, log_mean, log_var, fitted, np.zeros_like(log_var)
+
+    coeffs = np.polyfit(log_mean[fit_valid], log_var[fit_valid], deg=poly_deg)
+    fitted_log_var = np.polyval(coeffs, log_mean)
+    residuals = log_var - fitted_log_var
+    residuals_for_ranking = np.where(rank_pool, residuals, -np.inf)
+
+    n_top_eff = min(n_top, int(rank_pool.sum()))
+    top = np.argsort(residuals_for_ranking)[-n_top_eff:][::-1]
+    return top, log_mean, log_var, fitted_log_var, residuals
+
+
+def _batched_multinomial(rng, n: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Batched multinomial sampler via sequential binomial decomposition.
+
+    Each row is independently drawn from Multinomial(n[i], p[i, :]). Works on
+    both ``np.random.RandomState`` (legacy MT19937) and the newer Generator
+    types because both expose a vectorized ``binomial`` with broadcasting.
+
+    The recurrence is the standard composition: condition on the events
+    already assigned and the remaining probability mass, draw the next column
+    as a binomial of the remaining trials, then subtract.
+
+    Parameters
+    ----------
+    rng : np.random.RandomState or np.random.Generator
+        Source of randomness. Must support ``binomial(n, p)`` with vector args.
+    n : (M,) array of nonnegative integer trial counts.
+    p : (M, K) array of probability rows (each row should sum to ~1).
+
+    Returns
+    -------
+    (M, K) integer array. Rows sum exactly to ``n`` and entries are ``>= 0``.
+    """
+    n = np.asarray(n, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    M, K = p.shape
+    if M == 0 or K == 0:
+        return np.zeros((M, K), dtype=np.int64)
+
+    result = np.zeros((M, K), dtype=np.int64)
+    remaining = n.copy()
+    # cum_p[:, k] = sum_{j >= k} p[:, j], i.e. mass still available at column k.
+    cum_p = np.cumsum(p[:, ::-1], axis=1)[:, ::-1]
+    for k in range(K - 1):
+        denom = cum_p[:, k]
+        # When denom is zero (all remaining mass collapses to zero) skip the
+        # binomial and keep result[:, k] = 0.
+        with np.errstate(invalid='ignore', divide='ignore'):
+            prob_k = np.where(denom > 0, p[:, k] / denom, 0.0)
+        prob_k = np.clip(prob_k, 0.0, 1.0)
+        draw = rng.binomial(remaining, prob_k)
+        draw = np.minimum(draw, remaining)
+        result[:, k] = draw
+        remaining = remaining - draw
+    result[:, K - 1] = remaining
+    return result
+
+
+def _topic_stability(aligned_betas: List[np.ndarray]) -> float:
+    """Mean pairwise cosine similarity of aligned topic rows across replicates.
+
+    Inputs are a list of (K, G) topic-gene matrices that have already been row-
+    permuted into a common topic ordering (e.g. by Hungarian matching). For
+    every pair of replicates, compute the per-topic cosine similarity and
+    average across topics; then average across pairs.
+
+    Returns 1.0 for a single replicate (trivially stable) or perfectly
+    identical replicates; values approach 0 as replicates diverge.
+    """
+    n = len(aligned_betas)
+    if n < 2:
+        return 1.0
+    sims = []
+    for i in range(n):
+        norm_i = np.linalg.norm(aligned_betas[i], axis=1)
+        for j in range(i + 1, n):
+            norm_j = np.linalg.norm(aligned_betas[j], axis=1)
+            denom = np.maximum(norm_i * norm_j, 1e-12)
+            cos = np.sum(aligned_betas[i] * aligned_betas[j], axis=1) / denom
+            sims.append(float(np.mean(cos)))
+    return float(np.mean(sims))
+
+
+def _topic_log2fc(beta: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Per-topic log2 fold change of beta vs the mean beta of all other topics.
+
+    log2fc[k, g] = log2( beta[k, g] / mean_{k' != k}( beta[k', g] ) )
+
+    Ranking genes by this quantity highlights what is *specific* to a topic
+    rather than what is merely highly expressed everywhere, which is the
+    interpretive lens STdeconvolve uses in its topGenes / getBetaTheta output.
+    Falls through to zeros when there is only a single topic.
+
+    Parameters
+    ----------
+    beta : (K, G) topic-gene distribution. Rows do not need to sum to 1 (we
+        compare ratios, so any per-row scaling cancels).
+
+    Returns
+    -------
+    log2fc : (K, G) array.
+    """
+    K = beta.shape[0]
+    if K <= 1:
+        return np.zeros_like(beta)
+    total = beta.sum(axis=0, keepdims=True)
+    mean_other = (total - beta) / (K - 1)
+    return np.log2((beta + eps) / (mean_other + eps))
 
 
 # STEP 1: load
@@ -550,11 +819,50 @@ def step3_feature_selection(
     config_path: str,
     species: str,
     n_hvg: int = 2000,
+    od_poly_deg: int = 3,
+    min_pct_spots: float = 0.05,
+    max_pct_spots: float = 0.95,
+    pct_filter_mode: str = "all",
 ) -> HvgPack:
-    """Per-slice noise filter, intersect across slices, then HVG select on concatenated counts.
+    """Per-slice noise filter, intersect across slices, restrict the candidate
+    gene pool by spot-presence fraction, then overdispersed-gene select on the
+    candidates.
 
-    Each slice's counts_clean and genes_clean are filled in. HvgPack returns the joint HVG
-    set on the intersected gene index space.
+    Pipeline inside this step:
+
+      1. Per-slice noise regex filter from the species profile.
+      2. Intersect gene sets across slices.
+      3. Restrict the candidate pool by spot-presence fraction (mimics
+         STdeconvolve's restrictCorpus): per slice, the fraction of spots in
+         which a gene has count > 0 must lie within
+         ``[min_pct_spots, max_pct_spots]``. With multiple slices, ``"any"``
+         mode keeps a gene that passes in any one slice; ``"all"`` mode
+         requires it to pass in every slice. The presence filter only restricts
+         the pool considered for overdispersed selection — the per-slice
+         ``genes_clean`` and ``HvgPack.intersected_genes`` keep the full
+         noise-filtered intersection, so Steps 4 / 6 / 7 / 9 still see all
+         genes.
+      4. Overdispersed-gene selection via mean-variance trend residual: the
+         polynomial trend ``log10(var) ~ poly(log10(mean))`` is fit on
+         candidates only (so rare and ubiquitous filtered-out genes don't pull
+         the curve), and the top ``n_hvg`` candidates by residual become the
+         overdispersed gene set.
+
+    The ``hvg_*`` field names on HvgPack are kept for backward compatibility
+    with Steps 4-9; semantically they now hold the overdispersed gene set.
+
+    Parameters
+    ----------
+    n_hvg : int
+        Number of top overdispersed genes to retain.
+    od_poly_deg : int
+        Polynomial degree for the smoothed mean-variance trend (default 3).
+    min_pct_spots, max_pct_spots : float
+        Fraction-of-spots window for the presence filter. A gene passes if its
+        spot-occupancy lies in [min_pct_spots, max_pct_spots] in (any | all)
+        slice(s). Defaults 0.05 / 0.95.
+    pct_filter_mode : str
+        ``"any"`` (default) or ``"all"`` — see above.
     """
     start_time = time.perf_counter()
     profile = _load_config(config_path, species)
@@ -604,60 +912,101 @@ def step3_feature_selection(
         ord_idx = [gene_to_idx[g] for g in intersected]
         inter_counts_per_slice[name] = sd.counts_clean[:, ord_idx]
 
-    # Concatenate (rows = spots) for joint HVG calculation
+    # Concatenate (rows = spots) for joint trend / overdispersed calculation.
     inter_concat = sp.vstack([inter_counts_per_slice[n] for n in slices.keys()]).tocsr()
 
-    # HVG selection on the joint matrix using Seurat-style log-variance dispersion
-    print(f"Step 3: selecting top {n_hvg} HVGs from joint intersected matrix...")
-    row_sums = np.array(inter_concat.sum(axis=1)).flatten()
-    row_sums[row_sums == 0] = 1
-    norm_counts = inter_concat.copy().astype(float)
-    norm_counts.data /= np.repeat(row_sums, np.diff(norm_counts.indptr))
-    norm_counts.data *= 10000.0
-    norm_counts.data = np.log1p(norm_counts.data)
+    # Presence filter (restrictCorpus). Per slice, compute the fraction of spots
+    # in which each gene has count > 0; gene "passes" if the fraction is in
+    # [min_pct_spots, max_pct_spots]. Combine across slices via the requested
+    # mode. This filter only restricts the candidate pool for the overdispersed
+    # selection — sd.genes_clean and HvgPack.intersected_genes remain untouched.
+    if pct_filter_mode not in ("any", "all"):
+        raise ValueError(
+            f"pct_filter_mode must be 'any' or 'all', got {pct_filter_mode!r}"
+        )
 
-    mean_expr = np.array(norm_counts.mean(axis=0)).flatten()
-    sq_counts = norm_counts.copy()
-    sq_counts.data **= 2
-    mean_sq = np.array(sq_counts.mean(axis=0)).flatten()
-    var_expr = mean_sq - (mean_expr ** 2)
+    n_intersect = len(intersected)
+    pass_matrix = np.zeros((len(slices), n_intersect), dtype=bool)
+    print(f"Step 3: presence filter [{min_pct_spots:.2f}, {max_pct_spots:.2f}] "
+          f"({pct_filter_mode} across slices)")
+    for i, (name, _sd) in enumerate(slices.items()):
+        X_s = inter_counts_per_slice[name]
+        presence = np.asarray((X_s > 0).sum(axis=0)).flatten() / float(X_s.shape[0])
+        passes = (presence >= min_pct_spots) & (presence <= max_pct_spots)
+        pass_matrix[i] = passes
+        print(f"   [{name}] presence pass: {int(passes.sum())}/{n_intersect}")
 
-    # Bin-normalized dispersion
-    n_bins = 20
-    bins = np.linspace(np.min(mean_expr), np.max(mean_expr), n_bins + 1)
-    dispersion_norm = np.zeros_like(var_expr)
-    for i in range(n_bins):
-        idx = np.where((mean_expr >= bins[i]) & (mean_expr < bins[i + 1]))[0]
-        if len(idx) > 0:
-            bin_var = var_expr[idx]
-            bin_mean_var = np.mean(bin_var)
-            bin_std_var = np.std(bin_var)
-            if bin_std_var > 0:
-                dispersion_norm[idx] = (bin_var - bin_mean_var) / bin_std_var
+    if pct_filter_mode == "any":
+        candidate_mask = pass_matrix.any(axis=0)
+    else:  # "all"
+        candidate_mask = pass_matrix.all(axis=0)
+    n_candidates = int(candidate_mask.sum())
+    print(f"   combined: {n_candidates}/{n_intersect} candidate genes after filter")
 
-    n_hvg_eff = min(n_hvg, len(intersected))
-    hvg_indices_local = np.argsort(dispersion_norm)[-n_hvg_eff:][::-1]
+    if n_candidates < max(10, od_poly_deg + 1):
+        raise ValueError(
+            f"Presence filter left only {n_candidates} candidate genes — "
+            "loosen min_pct_spots / max_pct_spots or check the data."
+        )
+
+    # Overdispersed gene selection: trend fit and ranking restricted to candidates.
+    print(f"Step 3: selecting top {n_hvg} overdispersed genes from {n_candidates} candidates...")
+    n_hvg_eff = min(n_hvg, n_candidates)
+    hvg_indices_local, log_mean, log_var, fitted_log_var, residuals = _overdispersed_genes(
+        inter_concat, n_top=n_hvg_eff, poly_deg=od_poly_deg, fit_mask=candidate_mask
+    )
     hvg_names = [intersected[i] for i in hvg_indices_local]
 
-    # Per-slice HVG count matrices
+    # Per-slice overdispersed-gene count matrices.
     hvg_per_slice: Dict[str, sp.csr_matrix] = {
         name: inter_counts_per_slice[name][:, hvg_indices_local] for name in slices.keys()
     }
     hvg_concat = inter_concat[:, hvg_indices_local]
 
-    # Diagnostic plot
-    plt.figure(figsize=(9, 7))
-    plt.scatter(mean_expr, dispersion_norm, s=1, color='grey', alpha=0.5, label='Non-HVG')
-    plt.scatter(mean_expr[hvg_indices_local], dispersion_norm[hvg_indices_local], s=1, color='red', label='HVG')
-    plt.xlabel('Mean expression (log)')
-    plt.ylabel('Normalized dispersion')
-    plt.title(f'Step 3: joint HVG selection ({n_hvg_eff} of {len(intersected)} intersected genes)')
-    plt.legend()
+    # Diagnostic plot: residuals above the smoothed mean-variance trend, split
+    # into three populations: filtered-out (failed presence filter), candidates
+    # not selected, and selected overdispersed. x-axis clipped at the 5th
+    # percentile so the +eps padded zero-expression tail doesn't blow out view.
+    is_top = np.zeros(n_intersect, dtype=bool)
+    is_top[hvg_indices_local] = True
+    cand_not_top = candidate_mask & (~is_top)
+    filt_out = ~candidate_mask
+
+    plt.figure(figsize=(9, 6))
+    plt.scatter(log_mean[filt_out], residuals[filt_out], s=2, color='lightgrey', alpha=0.35,
+                label=f'Filtered out (presence): {int(filt_out.sum())}')
+    plt.scatter(log_mean[cand_not_top], residuals[cand_not_top], s=2, color='steelblue', alpha=0.45,
+                label=f'Candidates (not selected): {int(cand_not_top.sum())}')
+    plt.scatter(log_mean[is_top], residuals[is_top], s=4, color='red',
+                label=f'Overdispersed (selected): {n_hvg_eff}')
+    plt.axhline(0.0, color='black', linewidth=1.0, linestyle='--')
+    
+    cand_mean = log_mean[candidate_mask]
+    if cand_mean.size > 0:
+        x_low = float(np.min(cand_mean)) - 0.2
+        x_high = float(np.max(log_mean)) + 0.2
+        plt.xlim(x_low, x_high)
+
+    cand_residuals = residuals[candidate_mask]
+    if cand_residuals.size > 0:
+        y_low = float(np.percentile(cand_residuals, 0.5))
+        y_high = float(np.percentile(cand_residuals, 99.9))
+        y_range = max(y_high - y_low, 1e-6)
+        
+        pad = 0.1 * y_range
+        plt.ylim(min(-0.5, y_low - pad), max(1.0, y_high + pad))
+
+    plt.xlabel('log10(mean expression)')
+    plt.ylabel('Residual log10(variance) — observed minus trend')
+    plt.title(f'Step 3: overdispersion score (top {n_hvg_eff} of {n_candidates} candidates; '
+              f'{n_intersect} intersected genes)')
+    plt.legend(loc='best')
     plt.grid(True, alpha=0.3)
+    plt.tight_layout()
     plt.show()
 
     duration = time.perf_counter() - start_time
-    print(f"Step 3 done in {duration:.2f}s   joint HVG matrix: {hvg_concat.shape}")
+    print(f"Step 3 done in {duration:.2f}s   joint overdispersed-gene matrix: {hvg_concat.shape}")
     return HvgPack(
         intersected_genes=intersected,
         hvg_names=hvg_names,
@@ -667,7 +1016,7 @@ def step3_feature_selection(
     )
 
 
-# STEP 4: joint manifold (over intersected genes)
+# STEP 4: joint manifold
 
 def step4_gene_manifold(
     slices: Dict[str, SliceData],
@@ -678,7 +1027,7 @@ def step4_gene_manifold(
     """ICA + UMAP on the gene matrix to produce a gene manifold.
 
     Single slice: uses the slice's counts_clean directly in its native gene order
-    (matches legacy codeconv step4 behavior bit-for-bit modulo upstream tie-breaking).
+    (matches legacy codeconv Step 4 behavior bit-for-bit modulo upstream tie-breaking).
     Multi-slice: uses the alphabetical-intersected stacked matrix so all slices share
     a common gene index space.
     """
@@ -764,7 +1113,7 @@ def step4_gene_manifold(
     )
 
 
-# STEP 5: K sweep (per-slice; joint and heatmap only when multi-slice)
+# STEP 5: K sweep
 
 def step5_ksweep(
     hvg_pack: HvgPack,
@@ -774,14 +1123,65 @@ def step5_ksweep(
     subsample_frac: float = 1.0,
     doc_topic_prior: float = 0.1,
     topic_word_prior: float = 0.01,
-) -> dict:
-    """Run LDA perplexity sweep per slice. With multiple slices, also runs a joint sweep
-    on the concatenated HVG matrix and shows a relative-perplexity heatmap for cross-slice
-    comparison. Single-slice runs skip the joint sweep and the heatmap (both redundant).
+    perc_rare_thresh: float = 0.05,
+    alpha_mle_max_iter: int = 200,
+    holdout_frac: float = 0.3,
+) -> "KSweepResult":
+    """Run an LDA K-sweep and visualize held-out perplexity alongside rare-topic count.
+
+    For every K we fit LDA on a random 70/30 train/test split of the spots
+    (split fixed across K so the K values are honestly comparable) and record:
+
+      1. Held-out perplexity, evaluated on the test split. Lower is a better
+         out-of-sample fit. The train/test split prevents the same-data
+         optimism the in-sample perplexity would have.
+      2. Rare-topic count: number of topics whose mean proportion across the
+         train spots is below ``perc_rare_thresh`` (default 0.05). Rare topics
+         indicate the model is over-splitting into spurious cell types — K is
+         "too high" once rare topics appear.
+      3. Mean Dirichlet alpha, estimated post-hoc from the fitted theta via
+         Minka's fixed-point iteration. Used internally by the recommended-K
+         rule as a soft constraint (alpha < 1 means each spot stays dominated
+         by a few topics). Not plotted because sklearn's fixed doc_topic_prior
+         keeps the post-hoc estimate well below 1 across most K, so the metric
+         is rarely informative in this setting; the values remain available on
+         the returned object for inspection.
+
+    A combined optimal-K rule is computed and stored on the returned
+    ``recommended_k`` field but not printed, since the right K rarely lines up
+    with a single hard rule across datasets — use it as a starting point and
+    pick the final K from the plots and the per-topic content in Step 6.
+
+    With multiple slices, also runs a joint sweep on the concatenated
+    overdispersed-gene matrix and shows two cross-slice heatmaps: relative
+    perplexity and rare-topic count. Single-slice runs skip the joint sweep and
+    the heatmaps (both redundant).
+
+    Parameters
+    ----------
+    perc_rare_thresh : float
+        Threshold below which a topic's mean proportion across spots flags it
+        as rare. Default 0.05.
+    alpha_mle_max_iter : int
+        Maximum iterations for the Minka fixed-point alpha estimator per K.
+    holdout_frac : float
+        Fraction of spots held out for perplexity evaluation. Default 0.3
+        (70/30 train/test split). Pass 0.0 to evaluate perplexity on the full
+        training matrix (the legacy in-sample behavior).
+
+    Returns
+    -------
+    KSweepResult
+        Dataclass with a compact ``__repr__`` so notebook auto-display stays one
+        line. Fields: ``perplexity``, ``rare_topics``, ``alpha_mean``,
+        ``alpha_per_topic``, ``perc_rare_thresh``, ``recommended_k``.
     """
     start_time = time.perf_counter()
     ks = list(range(min_k, max_k + 1, step))
-    sweep: Dict[str, List[float]] = {}
+    sweep_perp: Dict[str, List[float]] = {}
+    sweep_rare: Dict[str, List[int]] = {}
+    sweep_alpha_mean: Dict[str, List[float]] = {}
+    sweep_alpha_full: Dict[str, List[np.ndarray]] = {}
 
     n_slices = len(hvg_pack.hvg_per_slice)
     targets = dict(hvg_pack.hvg_per_slice)
@@ -792,15 +1192,37 @@ def step5_ksweep(
         n_spots = X.shape[0]
         if subsample_frac < 1.0 and n_spots > 1000:
             n_sub = int(n_spots * subsample_frac)
-            rng = np.random.default_rng(_SEED)
-            idx = rng.choice(n_spots, n_sub, replace=False)
+            sub_rng = np.random.default_rng(_SEED)
+            idx = sub_rng.choice(n_spots, n_sub, replace=False)
             X_use = X[idx, :]
             print(f"Step 5 [{label}]: {n_sub}/{n_spots} subsample")
         else:
             X_use = X
             print(f"Step 5 [{label}]: full {n_spots} spots")
 
-        perps = []
+        # Train/test split. Fixed across K so the K values are honestly
+        # comparable. holdout_frac=0.0 falls back to the legacy in-sample path.
+        n_use = X_use.shape[0]
+        if holdout_frac > 0.0 and n_use >= 10:
+            split_rng = np.random.default_rng(_SEED + 7919)
+            n_test = max(1, int(round(n_use * holdout_frac)))
+            all_idx = np.arange(n_use)
+            split_rng.shuffle(all_idx)
+            test_idx = all_idx[:n_test]
+            train_idx = all_idx[n_test:]
+            X_train = X_use[train_idx, :]
+            X_test = X_use[test_idx, :]
+            print(f"   train/test split: {len(train_idx)}/{len(test_idx)} ({(1 - holdout_frac):.2f}/{holdout_frac:.2f})")
+        else:
+            X_train = X_use
+            X_test = X_use
+            if holdout_frac > 0.0:
+                print(f"   too few spots ({n_use}) for a hold-out split; evaluating in-sample")
+
+        perps: List[float] = []
+        rares: List[int] = []
+        alpha_means: List[float] = []
+        alpha_fulls: List[np.ndarray] = []
         for k in tqdm(ks, desc=f"LDA sweep [{label}]"):
             lda = LatentDirichletAllocation(
                 n_components=k,
@@ -812,36 +1234,100 @@ def step5_ksweep(
                 doc_topic_prior=doc_topic_prior,
                 topic_word_prior=topic_word_prior,
             )
-            lda.fit(X_use)
-            perps.append(lda.perplexity(X_use))
-        sweep[label] = perps
+            # Fit on train; transform gives the train theta for the in-sample
+            # metrics. Perplexity is evaluated on the held-out test split.
+            theta_lda = lda.fit_transform(X_train)
+            row_sum = theta_lda.sum(axis=1, keepdims=True)
+            row_sum[row_sum == 0] = 1.0
+            theta_props = theta_lda / row_sum
 
-    # Plot 1: line plot of perplexity vs K
-    plt.figure(figsize=(10, 5))
-    for label, perps in sweep.items():
+            # Metric 1: held-out perplexity (on the test split).
+            perps.append(lda.perplexity(X_test))
+            # Metric 2: rare-topic count from train theta.
+            mean_theta = theta_props.mean(axis=0)
+            rares.append(int(np.sum(mean_theta < perc_rare_thresh)))
+            # Metric 3: Minka MLE Dirichlet alpha from train theta.
+            alpha_vec = _dirichlet_alpha_mle(theta_props, max_iter=alpha_mle_max_iter)
+            alpha_fulls.append(alpha_vec)
+            alpha_means.append(float(alpha_vec.mean()))
+
+        sweep_perp[label] = perps
+        sweep_rare[label] = rares
+        sweep_alpha_mean[label] = alpha_means
+        sweep_alpha_full[label] = alpha_fulls
+
+    # Combined optimal-K recommendation per target.
+    recommended_k: Dict[str, Dict[str, object]] = {}
+    for label in sweep_perp.keys():
+        perp_arr = np.array(sweep_perp[label])
+        rare_arr = np.array(sweep_rare[label])
+        alpha_arr = np.array(sweep_alpha_mean[label])
+        both = (alpha_arr < 1.0) & (rare_arr == 0)
+        if both.any():
+            best_local = int(np.argmin(np.where(both, perp_arr, np.inf)))
+            criterion = "alpha<1 AND rare==0; lowest perplexity"
+        elif (alpha_arr < 1.0).any():
+            mask = alpha_arr < 1.0
+            best_local = int(np.argmin(np.where(mask, perp_arr, np.inf)))
+            criterion = "alpha<1 only; lowest perplexity (no K reached rare==0)"
+        else:
+            best_local = int(np.argmin(perp_arr))
+            criterion = "fallback: lowest perplexity (no K reached alpha<1)"
+        recommended_k[label] = {'k': int(ks[best_local]), 'criterion': criterion}
+
+    # Plot 1: dual-axis line plot — perplexity (solid o) + rare topics (right, dashed s)
+    from matplotlib.ticker import MaxNLocator
+    fig, ax1 = plt.subplots(figsize=(11, 5.5))
+    color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    label_color = {lbl: color_cycle[i % len(color_cycle)] for i, lbl in enumerate(sweep_perp.keys())}
+
+    for label, perps in sweep_perp.items():
         lw = 2.5 if label == '_joint' else 1.5
-        plt.plot(ks, perps, marker='o', markerfacecolor='white', label=label, linewidth=lw)
-    plt.xlabel("K topics")
-    plt.ylabel("Perplexity (lower = better fit)")
-    title = "Step 5: K-sweep" + (", per slice + joint" if n_slices > 1 else "")
+        ax1.plot(ks, perps, marker='o', markerfacecolor='white',
+                 color=label_color[label], linewidth=lw)
+    ax1.set_xlabel("K topics")
+    ax1.set_ylabel("Held-out perplexity (lower = better fit)")
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    for label, rares in sweep_rare.items():
+        lw = 2.5 if label == '_joint' else 1.5
+        ax2.plot(ks, rares, marker='s', linestyle='--',
+                 color=label_color[label], linewidth=lw, alpha=0.85)
+    ax2.set_ylabel(f"# rare topics (mean θ < {perc_rare_thresh:.2f})")
+    ax2.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+    # Compact legend: one entry per slice (color) + a linestyle key for metric.
+    slice_handles = [plt.Line2D([0], [0], color=label_color[lbl], linewidth=2, label=lbl)
+                     for lbl in sweep_perp.keys()]
+    style_handles = [
+        plt.Line2D([0], [0], color='black', linewidth=1.5,
+                   marker='o', markerfacecolor='white', label='Perplexity'),
+        plt.Line2D([0], [0], color='black', linewidth=1.5,
+                   linestyle='--', marker='s', label='Rare topics'),
+    ]
+    ax1.legend(handles=slice_handles + style_handles, loc='best', fontsize=8, ncol=2)
+
+    title = "Step 5: K-sweep — Perplexity + Rare topics" + (
+        ", per slice + joint" if n_slices > 1 else ""
+    )
     plt.title(title)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
     plt.tight_layout()
     plt.show()
 
-    # Plot 2: cross-slice heatmap (only meaningful with 2+ slices)
-    slice_labels = [k for k in sweep.keys() if k != '_joint']
+    # Cross-slice heatmaps (only meaningful with 2+ slices).
+    slice_labels = [k for k in sweep_perp.keys() if k != '_joint']
     if len(slice_labels) > 1:
+        # Plot 2a: relative perplexity heatmap
         mat = np.zeros((len(slice_labels), len(ks)))
         for i, lbl in enumerate(slice_labels):
-            row = np.array(sweep[lbl], dtype=float)
-            rng = row.max() - row.min()
-            mat[i] = (row - row.min()) / rng if rng > 0 else 0.0
+            row = np.array(sweep_perp[lbl], dtype=float)
+            row_range = row.max() - row.min()
+            mat[i] = (row - row.min()) / row_range if row_range > 0 else 0.0
         plt.figure(figsize=(max(8, len(ks) * 0.5), 0.6 * len(slice_labels) + 2))
         sns.heatmap(mat, xticklabels=ks, yticklabels=slice_labels,
                     cmap='viridis_r', annot=False, cbar_kws={'label': 'relative perplexity'})
-        raw_mat = np.array([sweep[lbl] for lbl in slice_labels])
+        raw_mat = np.array([sweep_perp[lbl] for lbl in slice_labels])
         median_per_k = np.median(raw_mat, axis=0)
         best_k_idx = int(np.argmin(median_per_k))
         plt.axvline(best_k_idx + 0.5, color='red', linestyle='--', linewidth=1.5)
@@ -851,9 +1337,36 @@ def step5_ksweep(
         plt.tight_layout()
         plt.show()
 
+        # Plot 2b: rare-topic count heatmap (raw counts, annotated)
+        rare_mat = np.array([sweep_rare[lbl] for lbl in slice_labels], dtype=int)
+        plt.figure(figsize=(max(8, len(ks) * 0.5), 0.6 * len(slice_labels) + 2))
+        sns.heatmap(rare_mat, xticklabels=ks, yticklabels=slice_labels,
+                    cmap='Reds', annot=True, fmt='d',
+                    cbar_kws={'label': f'# rare topics (mean θ < {perc_rare_thresh:.2f})'})
+        median_rare_per_k = np.median(rare_mat, axis=0)
+        zero_rare = np.where(median_rare_per_k == 0)[0]
+        if len(zero_rare) > 0:
+            last_clean_k_idx = int(zero_rare.max())
+            plt.axvline(last_clean_k_idx + 0.5, color='blue', linestyle='--', linewidth=1.5)
+            rare_guidance = f"largest K with median rare=0 is K={ks[last_clean_k_idx]}"
+        else:
+            rare_guidance = "all K have rare topics — consider lowering K"
+        plt.title(f"Step 5: rare topics by K  ({rare_guidance})")
+        plt.xlabel("K")
+        plt.ylabel("Slice")
+        plt.tight_layout()
+        plt.show()
+
     duration = time.perf_counter() - start_time
-    print(f"Step 5 done in {duration:.2f}s")
-    return {label: dict(zip(ks, perps)) for label, perps in sweep.items()}
+    print(f"\nStep 5 done in {duration:.2f}s")
+    return KSweepResult(
+        perplexity={label: dict(zip(ks, perps)) for label, perps in sweep_perp.items()},
+        rare_topics={label: dict(zip(ks, rares)) for label, rares in sweep_rare.items()},
+        alpha_mean={label: dict(zip(ks, alphas)) for label, alphas in sweep_alpha_mean.items()},
+        alpha_per_topic={label: dict(zip(ks, sweep_alpha_full[label])) for label in sweep_alpha_full},
+        perc_rare_thresh=perc_rare_thresh,
+        recommended_k=recommended_k,
+    )
 
 
 # STEP 6: per-slice LDA -> Hungarian alignment -> consensus beta -> per-slice theta refit + projection
@@ -869,37 +1382,117 @@ def step6_final_deconvolution(
     doc_topic_prior: float = 0.1,
     topic_word_prior: float = 0.01,
     e_step_iters: int = 50,
+    n_seeds: int = 1,
 ) -> Model:
-    """LDA fit per slice. With multiple slices, topics are aligned across slices via
-    Hungarian matching on cosine similarity of betas, a mean-consensus beta is built,
-    and per-slice theta is refit against the frozen consensus beta via variational E-step.
-    With a single slice, the LDA beta is the model directly. Per-slice manifold-guided
-    projection then extends consensus topics to each slice's full genes_clean.
+    """LDA fit per slice with optional multi-seed consensus to stabilize topics.
+
+    Per slice, fit LDA with ``n_seeds`` independent random initializations
+    (seeds ``_SEED`` ... ``_SEED + n_seeds - 1``), Hungarian-align all replicate
+    betas (and thetas) to the seed-0 ordering, and take their mean as that
+    slice's beta. Single LDA fits are highly sensitive to initialization, so
+    a 5-10 seed consensus gives substantially more reproducible topic content
+    at the cost of an N-times longer Step 6.
+
+    A per-slice topic stability score — the mean pairwise cosine similarity of
+    aligned topic rows across seeds — is computed and stored on the returned
+    Model. 1.0 means seeds are identical; values closer to 0 mean topics drift
+    across seeds and the K may be too high (or the data underdetermines that
+    many topics).
+
+    With multiple slices, the per-slice consensus betas are then Hungarian-
+    aligned across slices and meaned to form ``beta_consensus``, and per-slice
+    theta is refit against the frozen consensus beta via the variational E-step.
+    With a single slice, the per-slice consensus beta IS the model.
+    Per-slice manifold-guided projection extends consensus topics to each
+    slice's full ``genes_clean``.
+
+    Parameters
+    ----------
+    n_seeds : int
+        Number of LDA seeds per slice to consensus-average. Default 1 keeps the
+        legacy single-seed behavior. 5-10 is recommended for stable topics.
     """
     start_time = time.perf_counter()
     n_slices = len(slices)
     n_hvg = len(hvg_pack.hvg_names)
-    print(f"Step 6: LDA fit, K={n_topics}   ({n_slices} slice{'s' if n_slices > 1 else ''})")
+    n_seeds = max(1, int(n_seeds))
+    print(f"Step 6: LDA fit, K={n_topics}   ({n_slices} slice{'s' if n_slices > 1 else ''}, n_seeds={n_seeds})")
 
     per_slice_betas_unaligned: Dict[str, np.ndarray] = {}
     per_slice_thetas_lda: Dict[str, np.ndarray] = {}
+    per_slice_stability: Dict[str, float] = {}
     for name in slices.keys():
         X = hvg_pack.hvg_per_slice[name]
-        print(f"   [{name}] LDA on {X.shape[0]} spots")
-        lda = LatentDirichletAllocation(
-            n_components=n_topics,
-            learning_method='batch',
-            max_iter=n_iters,
-            random_state=_SEED,
-            n_jobs=-1,
-            verbose=0,
-            doc_topic_prior=doc_topic_prior,
-            topic_word_prior=topic_word_prior,
-        )
-        theta_lda = lda.fit_transform(X)
-        beta = lda.components_ / lda.components_.sum(axis=1, keepdims=True)
-        per_slice_betas_unaligned[name] = beta
-        per_slice_thetas_lda[name] = theta_lda
+        if n_seeds == 1:
+            print(f"   [{name}] LDA on {X.shape[0]} spots (single seed)")
+            lda = LatentDirichletAllocation(
+                n_components=n_topics,
+                learning_method='batch',
+                max_iter=n_iters,
+                random_state=_SEED,
+                n_jobs=-1,
+                verbose=0,
+                doc_topic_prior=doc_topic_prior,
+                topic_word_prior=topic_word_prior,
+            )
+            theta_lda = lda.fit_transform(X)
+            beta = lda.components_ / lda.components_.sum(axis=1, keepdims=True)
+            per_slice_betas_unaligned[name] = beta
+            per_slice_thetas_lda[name] = theta_lda
+            per_slice_stability[name] = 1.0
+        else:
+            print(f"   [{name}] LDA on {X.shape[0]} spots ({n_seeds}-seed consensus)")
+            seed_betas: List[np.ndarray] = []
+            seed_thetas: List[np.ndarray] = []
+            for i in range(n_seeds):
+                lda = LatentDirichletAllocation(
+                    n_components=n_topics,
+                    learning_method='batch',
+                    max_iter=n_iters,
+                    random_state=_SEED + i,
+                    n_jobs=-1,
+                    verbose=0,
+                    doc_topic_prior=doc_topic_prior,
+                    topic_word_prior=topic_word_prior,
+                )
+                t = lda.fit_transform(X)
+                b = lda.components_ / lda.components_.sum(axis=1, keepdims=True)
+                seed_betas.append(b)
+                seed_thetas.append(t)
+
+            # Hungarian-align each seed to seed 0 on cosine of beta rows. Apply
+            # the same column permutation to the corresponding theta.
+            anchor = seed_betas[0]
+            anchor_norms = np.linalg.norm(anchor, axis=1, keepdims=True)
+            anchor_norms[anchor_norms == 0] = 1.0
+            anchor_norm = anchor / anchor_norms
+            aligned_b: List[np.ndarray] = [anchor]
+            aligned_t: List[np.ndarray] = [seed_thetas[0]]
+            for i in range(1, n_seeds):
+                b = seed_betas[i]
+                b_norms = np.linalg.norm(b, axis=1, keepdims=True)
+                b_norms[b_norms == 0] = 1.0
+                b_norm = b / b_norms
+                sim = anchor_norm @ b_norm.T
+                row_ind, col_ind = linear_sum_assignment(-sim)
+                new_b = np.zeros_like(b)
+                new_b[row_ind] = b[col_ind]
+                new_t = seed_thetas[i][:, col_ind]
+                aligned_b.append(new_b)
+                aligned_t.append(new_t)
+
+            beta_mean = np.mean(np.stack(aligned_b, axis=0), axis=0)
+            beta_mean = beta_mean / beta_mean.sum(axis=1, keepdims=True)
+            theta_mean = np.mean(np.stack(aligned_t, axis=0), axis=0)
+            t_sum = theta_mean.sum(axis=1, keepdims=True)
+            t_sum[t_sum == 0] = 1.0
+            theta_mean = theta_mean / t_sum
+
+            stability = _topic_stability(aligned_b)
+            per_slice_betas_unaligned[name] = beta_mean
+            per_slice_thetas_lda[name] = theta_mean
+            per_slice_stability[name] = stability
+            print(f"      topic stability across {n_seeds} seeds: {stability:.3f} (1.0 = identical)")
 
     if n_slices > 1:
         # Multi-slice path: align topics, build consensus beta, refit theta with frozen beta
@@ -957,14 +1550,17 @@ def step6_final_deconvolution(
             per_slice_betas_full[name] = beta_full
             print(f"   [{name}] beta_final {beta_full.shape}")
 
-        # Multi-slice QC: from beta_consensus on HVG (per-slice betas differ, HVG is the shared basis)
+        # Multi-slice QC: rank genes per topic by log2 fold change of beta vs
+        # the mean beta of the other topics. This highlights topic-specific
+        # markers rather than genes that are simply highly expressed everywhere.
+        log2fc_consensus = _topic_log2fc(beta_consensus)
         topic_dict = {}
         for k in range(n_topics):
-            top_idx = beta_consensus[k].argsort()[::-1][:15]
+            top_idx = log2fc_consensus[k].argsort()[::-1][:15]
             topic_dict[f"Topic_{k}"] = [hvg_pack.hvg_names[i] for i in top_idx]
         qc_df = pd.DataFrame(topic_dict)
     else:
-        # Single-slice path mirrors the legacy codeconv step6: LDA fit_transform
+        # Single-slice path mirrors the legacy codeconv Step 6: LDA fit_transform
         # gives theta and beta_hvg, then a single cdist-based projection extends
         # beta to the full genes_clean. QC table is built from the projected beta_final.
         only_name = next(iter(slices.keys()))
@@ -1008,10 +1604,12 @@ def step6_final_deconvolution(
         per_slice_betas_full = {only_name: beta_final}
         print(f"   [{only_name}] beta_final {beta_final.shape}")
 
-        # Single-slice QC: top genes per topic from beta_final on full genes_clean (matches legacy behavior)
+        # Single-slice QC: rank genes per topic by log2 fold change of beta_final
+        # vs the mean beta of the other topics, on the full genes_clean basis.
+        log2fc_final = _topic_log2fc(beta_final)
         topic_dict = {}
         for k in range(n_topics):
-            top_idx = beta_final[k].argsort()[::-1][:15]
+            top_idx = log2fc_final[k].argsort()[::-1][:15]
             topic_dict[f"Topic_{k}"] = [genes_s[i] for i in top_idx]
         qc_df = pd.DataFrame(topic_dict)
 
@@ -1023,6 +1621,7 @@ def step6_final_deconvolution(
         beta_consensus=beta_consensus,
         qc_df=qc_df,
         per_slice_betas=per_slice_betas_full,
+        per_slice_stability=dict(per_slice_stability) if per_slice_stability else None,
     )
 
 
@@ -1041,6 +1640,13 @@ def step7_sampling_engine(
     Threshold-and-renormalize is always applied: any topic with theta < min_topic_percentage
     is zeroed and theta is renormalized. low_slice_quality=True per slice additionally
     enforces an inflate rescue: every surviving topic gets at least 1 cell.
+
+    The inner gene-and-cell allocation is vectorized via a sequential-binomial
+    batched multinomial sampler, so the draws are statistically equivalent to
+    the legacy per-gene-per-cell loop but the RNG draw order differs: outputs
+    will not be bit-for-bit identical to the legacy implementation under the
+    same seed. The marginals (per-spot UMI conservation, per-cell topic
+    assignment, gamma cell weights) are preserved.
     """
     start_time = time.perf_counter()
     profile = _load_config(config_path, species)
@@ -1053,7 +1659,7 @@ def step7_sampling_engine(
 
     out: Dict[str, dict] = {}
     # Use the legacy RandomState (Mersenne Twister) so that multinomial / gamma
-    # draws match the legacy codeconv step7 sequence sample-for-sample under the
+    # draws match the legacy codeconv Step 7 sequence sample-for-sample under the
     # same seed. PCG64 (np.random.default_rng) would draw a different sequence.
     rng = np.random.RandomState(_SEED)
 
@@ -1068,8 +1674,12 @@ def step7_sampling_engine(
         n_topics = model.n_topics
         beta = sd.beta_final  # (K, n_genes_s)
         theta = sd.theta      # (n_spots, K)
+        counts_csr = sd.counts_clean.tocsr()
 
-        rows, cols, data = [], [], []
+        # Triplet buffers built in chunks per spot; concatenated at the end.
+        rows_chunks: List[np.ndarray] = []
+        cols_chunks: List[np.ndarray] = []
+        data_chunks: List[np.ndarray] = []
         cell_metadata = []
         global_cell_idx = 0
         n_rescued = 0
@@ -1080,15 +1690,13 @@ def step7_sampling_engine(
             if n_total == 0:
                 continue
 
-            # Threshold-and-renormalize theta. Bypassed entirely when min_topic_percentage<=0
-            # so that legacy single-slice runs see theta_eff identical to theta[s] (no copy,
-            # no float drift from renormalization).
+            # Threshold-and-renormalize theta. Bypassed entirely when
+            # min_topic_percentage <= 0 so theta_eff stays identical to theta[s].
             if min_topic_percentage > 0:
                 theta_eff = theta[s].copy()
                 theta_eff[theta_eff < min_topic_percentage] = 0.0
                 tsum = theta_eff.sum()
                 if tsum <= 0:
-                    # Spot has no surviving topics; fall back to argmax of original theta
                     theta_eff = np.zeros_like(theta_eff)
                     theta_eff[int(np.argmax(theta[s]))] = 1.0
                     tsum = 1.0
@@ -1098,7 +1706,7 @@ def step7_sampling_engine(
 
             topic_dist = _safe_multinomial(rng, n_total, theta_eff)
 
-            # Inflate rescue for low-quality slices
+            # Inflate rescue for low-quality slices.
             if slice_low_q:
                 surviving = np.where(theta_eff > 0)[0]
                 for k in surviving:
@@ -1106,50 +1714,88 @@ def step7_sampling_engine(
                         topic_dist[k] = 1
                         n_rescued += 1
 
-            # Generate in-silico cells with gamma weights per topic group
-            cells_weights = {}
-            cells_indices = {}
+            # Per-topic cell groups: draw gamma cell weights, register the
+            # in-silico cell metadata, record the global cell indices.
+            cells_weights: Dict[int, np.ndarray] = {}
+            cells_indices: Dict[int, np.ndarray] = {}
             current_spot_cell_idx = 0
             for k in range(n_topics):
                 n_k = int(topic_dist[k])
-                if n_k > 0:
-                    w = rng.gamma(gamma_shape, gamma_scale, size=n_k)
-                    if w.sum() == 0:
-                        w = np.ones(n_k)
-                    cells_weights[k] = w / w.sum()
-                    for i in range(n_k):
-                        cell_metadata.append({
-                            'spot_idx': s,
-                            'topic_idx': k,
-                            'cell_num': current_spot_cell_idx + i + 1,
-                        })
-                    cells_indices[k] = [global_cell_idx + i for i in range(n_k)]
-                    global_cell_idx += n_k
-                    current_spot_cell_idx += n_k
+                if n_k <= 0:
+                    continue
+                w = rng.gamma(gamma_shape, gamma_scale, size=n_k)
+                if w.sum() == 0:
+                    w = np.ones(n_k)
+                cells_weights[k] = w / w.sum()
+                for i in range(n_k):
+                    cell_metadata.append({
+                        'spot_idx': s,
+                        'topic_idx': k,
+                        'cell_num': current_spot_cell_idx + i + 1,
+                    })
+                cells_indices[k] = np.arange(global_cell_idx, global_cell_idx + n_k, dtype=np.int64)
+                global_cell_idx += n_k
+                current_spot_cell_idx += n_k
 
-            # UMI allocation per gene present in this spot
-            spot_vec = sd.counts_clean[s].toarray().flatten()
-            genes_present = np.where(spot_vec > 0)[0]
-            for g in genes_present:
-                count = int(spot_vec[g])
-                p_topic = beta[:, g] * theta_eff
-                if p_topic.sum() == 0:
-                    # Match legacy codeconv: uniform fallback when projected beta is zero
-                    # across topics for this gene.
-                    p_topic = np.ones(n_topics) / n_topics
-                else:
-                    p_topic = p_topic / p_topic.sum()
-                umi_per_topic = _safe_multinomial(rng, count, p_topic)
+            # Pull the spot's nonzero (gene, count) entries directly from CSR —
+            # no full-row toarray(), no per-gene Python loop.
+            start, end = counts_csr.indptr[s], counts_csr.indptr[s + 1]
+            if start == end:
+                continue
+            gene_idx_arr = counts_csr.indices[start:end]
+            gene_count_arr = counts_csr.data[start:end].astype(np.int64)
+            n_present = gene_idx_arr.shape[0]
 
-                for k in range(n_topics):
-                    u_count = int(umi_per_topic[k])
-                    if u_count > 0 and k in cells_weights:
-                        umi_per_cell = _safe_multinomial(rng, u_count, cells_weights[k])
-                        for ci, val in enumerate(umi_per_cell):
-                            if val > 0:
-                                rows.append(cells_indices[k][ci])
-                                cols.append(g)
-                                data.append(val)
+            # p_topic for every (gene, topic) in one matmul. Rows that sum to
+            # zero (no beta mass for any topic) fall back to uniform, matching
+            # the legacy per-gene uniform fallback.
+            beta_sub = beta[:, gene_idx_arr].T  # (n_present, K)
+            p_topic_mat = beta_sub * theta_eff[None, :]
+            row_sums = p_topic_mat.sum(axis=1)
+            zero_rows = row_sums <= 0
+            if zero_rows.any():
+                p_topic_mat[zero_rows] = 1.0 / n_topics
+                row_sums[zero_rows] = 1.0
+            p_topic_mat = p_topic_mat / row_sums[:, None]
+
+            # Batched UMI-per-topic for every present gene at once.
+            umi_per_topic_mat = _batched_multinomial(rng, gene_count_arr, p_topic_mat)
+            # umi_per_topic_mat: (n_present, K)
+
+            # Per topic, batch-allocate the topic UMIs across the topic's cells.
+            for k in range(n_topics):
+                if k not in cells_indices:
+                    continue
+                n_k = cells_indices[k].shape[0]
+                u_counts_k = umi_per_topic_mat[:, k]
+                nonzero_g = np.flatnonzero(u_counts_k > 0)
+                if nonzero_g.size == 0:
+                    continue
+                # Broadcast cell weights across the genes-with-UMIs in this topic.
+                w_tiled = np.broadcast_to(
+                    cells_weights[k][None, :], (nonzero_g.size, n_k)
+                ).copy()
+                cell_alloc = _batched_multinomial(
+                    rng, u_counts_k[nonzero_g], w_tiled
+                )  # (n_genes_with_umi, n_k)
+
+                # Emit (row, col, data) triplets via np.where on the (gene, cell)
+                # block — no Python-side cell loop.
+                gi_idx, ci_idx = np.where(cell_alloc > 0)
+                if gi_idx.size == 0:
+                    continue
+                rows_chunks.append(cells_indices[k][ci_idx])
+                cols_chunks.append(gene_idx_arr[nonzero_g[gi_idx]])
+                data_chunks.append(cell_alloc[gi_idx, ci_idx].astype(np.int64))
+
+        if rows_chunks:
+            rows = np.concatenate(rows_chunks)
+            cols = np.concatenate(cols_chunks)
+            data = np.concatenate(data_chunks)
+        else:
+            rows = np.zeros(0, dtype=np.int64)
+            cols = np.zeros(0, dtype=np.int64)
+            data = np.zeros(0, dtype=np.int64)
 
         final_matrix = sp.csr_matrix((data, (rows, cols)), shape=(global_cell_idx, n_genes))
         print(f"   [{name}] generated {global_cell_idx} cells   rescued {n_rescued} topic slots")
