@@ -43,7 +43,7 @@ The notebook guides you through the 9-step pipeline:
 
 1. **Data Acquisition** — loading H5/MTX matrices and spatial metadata, per slice.
 2. **Density Estimation** — calculating cell counts via housekeeping gene calibration. Set `low_slice_quality=True` per slice to enforce a floor of one cell on every spot that passes the UMI gate.
-3. **Feature Selection** — filtering noise genes and identifying Highly Variable Genes on the intersected gene set across slices.
+3. **Feature Selection** — filtering noise genes and identifying Overdispersed Genes on the intersected gene set across slices.
 4. **Manifold Construction** — building the joint spatial gene co-expression topology via ICA + UMAP.
 5. **K-Sweep** — optimizing the number of latent topics. Diagnostic plots show per-slice and joint perplexity sweeps as both an overlaid line plot and a relative-perplexity heatmap.
 6. **Deconvolution** — per-slice LDA, Hungarian topic alignment across slices, mean-consensus β, per-slice θ refit via variational E-step with frozen consensus β, and per-slice projection of consensus topics onto each slice's full gene list.
