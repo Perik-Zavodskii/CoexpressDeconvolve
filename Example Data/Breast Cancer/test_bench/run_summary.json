@@ -1,0 +1,13 @@
+{
+  "slices": {
+    "Synthetic Visium": {
+      "slice_name": "Synthetic Visium",
+      "n_spots": 2500,
+      "n_cells_generated": 12382,
+      "n_topics": 6,
+      "n_rescued_topic_slots": 0,
+      "gene_count_export": 26157
+    }
+  },
+  "n_slices": 1
+}

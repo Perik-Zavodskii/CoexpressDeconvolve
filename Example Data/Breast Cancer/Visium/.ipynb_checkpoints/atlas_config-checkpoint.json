@@ -1,0 +1,23 @@
+{
+    "hk_profiles": {
+        "RPL19": 0.25,
+        "TUBB": 0.15,
+        "EEF1G": 0.25,
+        "PPIA": 0.05,
+        "GAPDH": 0.25,
+        "ABCF1": 0.12,
+        "SDHA": 0.1,
+        "OAZ1": 0.18,
+        "G6PD": 0.15,
+        "ALAS1": 0.12,
+        "GUSB": 0.1,
+        "HPRT1": 0.08,
+        "POLR2A": 0.08,
+        "POLR1B": 0.05,
+        "TBP": 0.12
+    },
+    "engine_parameters": {
+        "mu": 1.0,
+        "phi": 0.15
+    }
+}

@@ -2,7 +2,7 @@
 CoexpressDeconvolve main module.
 
 Multi-slice Visium deconvolution to in-silico single cells.
-Pipeline: load -> density -> HVG -> manifold -> K-sweep -> LDA -> sampling -> placement -> export.
+Pipeline: load -> density -> ODG -> manifold -> K-sweep -> LDA -> sampling -> placement -> export.
 
 Multi-slice handling:
   visium_path can be a string (single slice) or a dict {name: path} / list (multi).
@@ -88,12 +88,12 @@ class SliceData:
 
 
 @dataclass
-class HvgPack:
+class OdgPack:
     """Output of Step 3. Joint overdispersed-gene selection on the intersected gene set."""
     intersected_genes: List[str]
-    hvg_names: List[str]
-    hvg_per_slice: Dict[str, sp.csr_matrix]
-    hvg_concat: sp.csr_matrix
+    odg_names: List[str]
+    odg_per_slice: Dict[str, sp.csr_matrix]
+    odg_concat: sp.csr_matrix
     species: str
 
 
@@ -102,7 +102,7 @@ class Manifold:
     """Output of Step 4. Joint manifold on intersected genes."""
     embedding: np.ndarray
     intersected_genes: List[str]
-    hvg_indices_in_intersected: List[int]
+    odg_indices_in_intersected: List[int]
     species: str
 
 
@@ -110,7 +110,7 @@ class Manifold:
 class Model:
     """Output of Step 6. Consensus beta + per-slice theta."""
     n_topics: int
-    hvg_names: List[str]
+    odg_names: List[str]
     beta_consensus: np.ndarray
     qc_df: pd.DataFrame
     per_slice_betas: Dict[str, np.ndarray]
@@ -282,8 +282,7 @@ def _align_topics(betas: Dict[str, np.ndarray], anchor: Optional[str] = None) ->
 def _safe_multinomial(rng, n, p):
     """multinomial sample that tolerates float roundoff.
 
-    Tries the vanilla call first so well-formed inputs draw bit-for-bit identically
-    to a direct rng.multinomial(n, p) call. Falls back to a clip + normalize + shave
+    Tries a direct rng.multinomial(n, p) call. Falls back to a clip + normalize + shave
     pass only when vanilla raises ValueError (numpy strictly checks
     pvals[:-1].sum() > 1.0 and rejects ULP-level overflow).
     """
@@ -452,7 +451,7 @@ def _batched_multinomial(rng, n: np.ndarray, p: np.ndarray) -> np.ndarray:
     """Batched multinomial sampler via sequential binomial decomposition.
 
     Each row is independently drawn from Multinomial(n[i], p[i, :]). Works on
-    both ``np.random.RandomState`` (legacy MT19937) and the newer Generator
+    both ``np.random.RandomState`` and the newer Generator
     types because both expose a vectorized ``binomial`` with broadcasting.
 
     The recurrence is the standard composition: condition on the events
@@ -812,18 +811,18 @@ def step2_estimate_cell_density(
     return slices
 
 
-# STEP 3: HVG selection (joint, on intersected gene set)
+# STEP 3: ODG selection (joint, on intersected gene set)
 
 def step3_feature_selection(
     slices: Dict[str, SliceData],
     config_path: str,
     species: str,
-    n_hvg: int = 2000,
+    n_odg: int = 2000,
     od_poly_deg: int = 3,
     min_pct_spots: float = 0.05,
     max_pct_spots: float = 0.95,
     pct_filter_mode: str = "all",
-) -> HvgPack:
+) -> OdgPack:
     """Per-slice noise filter, intersect across slices, restrict the candidate
     gene pool by spot-presence fraction, then overdispersed-gene select on the
     candidates.
@@ -839,21 +838,22 @@ def step3_feature_selection(
          mode keeps a gene that passes in any one slice; ``"all"`` mode
          requires it to pass in every slice. The presence filter only restricts
          the pool considered for overdispersed selection — the per-slice
-         ``genes_clean`` and ``HvgPack.intersected_genes`` keep the full
+         ``genes_clean`` and ``OdgPack.intersected_genes`` keep the full
          noise-filtered intersection, so Steps 4 / 6 / 7 / 9 still see all
          genes.
       4. Overdispersed-gene selection via mean-variance trend residual: the
          polynomial trend ``log10(var) ~ poly(log10(mean))`` is fit on
          candidates only (so rare and ubiquitous filtered-out genes don't pull
-         the curve), and the top ``n_hvg`` candidates by residual become the
+         the curve), and the top ``n_odg`` candidates by residual become the
          overdispersed gene set.
 
-    The ``hvg_*`` field names on HvgPack are kept for backward compatibility
-    with Steps 4-9; semantically they now hold the overdispersed gene set.
+    The OdgPack output carries the selected ``odg_names`` / ``odg_per_slice``
+    / ``odg_concat``; Steps 4-9 consume these directly as the overdispersed
+    gene set.
 
     Parameters
     ----------
-    n_hvg : int
+    n_odg : int
         Number of top overdispersed genes to retain.
     od_poly_deg : int
         Polynomial degree for the smoothed mean-variance trend (default 3).
@@ -919,7 +919,7 @@ def step3_feature_selection(
     # in which each gene has count > 0; gene "passes" if the fraction is in
     # [min_pct_spots, max_pct_spots]. Combine across slices via the requested
     # mode. This filter only restricts the candidate pool for the overdispersed
-    # selection — sd.genes_clean and HvgPack.intersected_genes remain untouched.
+    # selection — sd.genes_clean and OdgPack.intersected_genes remain untouched.
     if pct_filter_mode not in ("any", "all"):
         raise ValueError(
             f"pct_filter_mode must be 'any' or 'all', got {pct_filter_mode!r}"
@@ -950,25 +950,25 @@ def step3_feature_selection(
         )
 
     # Overdispersed gene selection: trend fit and ranking restricted to candidates.
-    print(f"Step 3: selecting top {n_hvg} overdispersed genes from {n_candidates} candidates...")
-    n_hvg_eff = min(n_hvg, n_candidates)
-    hvg_indices_local, log_mean, log_var, fitted_log_var, residuals = _overdispersed_genes(
-        inter_concat, n_top=n_hvg_eff, poly_deg=od_poly_deg, fit_mask=candidate_mask
+    print(f"Step 3: selecting top {n_odg} overdispersed genes from {n_candidates} candidates...")
+    n_odg_eff = min(n_odg, n_candidates)
+    odg_indices_local, log_mean, log_var, fitted_log_var, residuals = _overdispersed_genes(
+        inter_concat, n_top=n_odg_eff, poly_deg=od_poly_deg, fit_mask=candidate_mask
     )
-    hvg_names = [intersected[i] for i in hvg_indices_local]
+    odg_names = [intersected[i] for i in odg_indices_local]
 
     # Per-slice overdispersed-gene count matrices.
-    hvg_per_slice: Dict[str, sp.csr_matrix] = {
-        name: inter_counts_per_slice[name][:, hvg_indices_local] for name in slices.keys()
+    odg_per_slice: Dict[str, sp.csr_matrix] = {
+        name: inter_counts_per_slice[name][:, odg_indices_local] for name in slices.keys()
     }
-    hvg_concat = inter_concat[:, hvg_indices_local]
+    odg_concat = inter_concat[:, odg_indices_local]
 
     # Diagnostic plot: residuals above the smoothed mean-variance trend, split
     # into three populations: filtered-out (failed presence filter), candidates
     # not selected, and selected overdispersed. x-axis clipped at the 5th
     # percentile so the +eps padded zero-expression tail doesn't blow out view.
     is_top = np.zeros(n_intersect, dtype=bool)
-    is_top[hvg_indices_local] = True
+    is_top[odg_indices_local] = True
     cand_not_top = candidate_mask & (~is_top)
     filt_out = ~candidate_mask
 
@@ -978,7 +978,7 @@ def step3_feature_selection(
     plt.scatter(log_mean[cand_not_top], residuals[cand_not_top], s=2, color='steelblue', alpha=0.45,
                 label=f'Candidates (not selected): {int(cand_not_top.sum())}')
     plt.scatter(log_mean[is_top], residuals[is_top], s=4, color='red',
-                label=f'Overdispersed (selected): {n_hvg_eff}')
+                label=f'Overdispersed (selected): {n_odg_eff}')
     plt.axhline(0.0, color='black', linewidth=1.0, linestyle='--')
     
     cand_mean = log_mean[candidate_mask]
@@ -998,7 +998,7 @@ def step3_feature_selection(
 
     plt.xlabel('log10(mean expression)')
     plt.ylabel('Residual log10(variance) — observed minus trend')
-    plt.title(f'Step 3: overdispersion score (top {n_hvg_eff} of {n_candidates} candidates; '
+    plt.title(f'Step 3: overdispersion score (top {n_odg_eff} of {n_candidates} candidates; '
               f'{n_intersect} intersected genes)')
     plt.legend(loc='best')
     plt.grid(True, alpha=0.3)
@@ -1006,12 +1006,12 @@ def step3_feature_selection(
     plt.show()
 
     duration = time.perf_counter() - start_time
-    print(f"Step 3 done in {duration:.2f}s   joint overdispersed-gene matrix: {hvg_concat.shape}")
-    return HvgPack(
+    print(f"Step 3 done in {duration:.2f}s   joint overdispersed-gene matrix: {odg_concat.shape}")
+    return OdgPack(
         intersected_genes=intersected,
-        hvg_names=hvg_names,
-        hvg_per_slice=hvg_per_slice,
-        hvg_concat=hvg_concat,
+        odg_names=odg_names,
+        odg_per_slice=odg_per_slice,
+        odg_concat=odg_concat,
         species=species,
     )
 
@@ -1020,7 +1020,7 @@ def step3_feature_selection(
 
 def step4_gene_manifold(
     slices: Dict[str, SliceData],
-    hvg_pack: HvgPack,
+    odg_pack: OdgPack,
     config_path: str,
     n_components: int = 30,
 ) -> Manifold:
@@ -1032,7 +1032,7 @@ def step4_gene_manifold(
     a common gene index space.
     """
     start_time = time.perf_counter()
-    species = hvg_pack.species
+    species = odg_pack.species
     profile = _load_config(config_path, species)
     qc_markers = profile.get('qc_markers', [])
 
@@ -1047,10 +1047,10 @@ def step4_gene_manifold(
         inter_concat_per_slice = []
         for name, sd in slices.items():
             gene_to_idx = {g: i for i, g in enumerate(sd.genes_clean)}
-            ord_idx = [gene_to_idx[g] for g in hvg_pack.intersected_genes]
+            ord_idx = [gene_to_idx[g] for g in odg_pack.intersected_genes]
             inter_concat_per_slice.append(sd.counts_clean[:, ord_idx])
         inter_concat = sp.vstack(inter_concat_per_slice).tocsr()
-        manifold_genes = list(hvg_pack.intersected_genes)
+        manifold_genes = list(odg_pack.intersected_genes)
         print(f"Step 4: building gene manifold over {inter_concat.shape[1]} intersected genes...")
 
     # Transpose: now rows are genes, columns are spots-across-slices
@@ -1073,9 +1073,9 @@ def step4_gene_manifold(
     )
     embedding = reducer.fit_transform(X_ica)
 
-    # HVG positions within the manifold's gene index space
+    # ODG positions within the manifold's gene index space
     inter_index = {g: i for i, g in enumerate(manifold_genes)}
-    hvg_indices_in_intersected = [inter_index[g] for g in hvg_pack.hvg_names]
+    odg_indices_in_intersected = [inter_index[g] for g in odg_pack.odg_names]
 
     # Visualization
     plt.figure(figsize=(8, 7), dpi=100)
@@ -1108,7 +1108,7 @@ def step4_gene_manifold(
     return Manifold(
         embedding=embedding,
         intersected_genes=manifold_genes,
-        hvg_indices_in_intersected=hvg_indices_in_intersected,
+        odg_indices_in_intersected=odg_indices_in_intersected,
         species=species,
     )
 
@@ -1116,7 +1116,7 @@ def step4_gene_manifold(
 # STEP 5: K sweep
 
 def step5_ksweep(
-    hvg_pack: HvgPack,
+    odg_pack: OdgPack,
     min_k: int = 3,
     max_k: int = 20,
     step: int = 1,
@@ -1183,10 +1183,10 @@ def step5_ksweep(
     sweep_alpha_mean: Dict[str, List[float]] = {}
     sweep_alpha_full: Dict[str, List[np.ndarray]] = {}
 
-    n_slices = len(hvg_pack.hvg_per_slice)
-    targets = dict(hvg_pack.hvg_per_slice)
+    n_slices = len(odg_pack.odg_per_slice)
+    targets = dict(odg_pack.odg_per_slice)
     if n_slices > 1:
-        targets['_joint'] = hvg_pack.hvg_concat
+        targets['_joint'] = odg_pack.odg_concat
 
     for label, X in targets.items():
         n_spots = X.shape[0]
@@ -1373,7 +1373,7 @@ def step5_ksweep(
 
 def step6_final_deconvolution(
     slices: Dict[str, SliceData],
-    hvg_pack: HvgPack,
+    odg_pack: OdgPack,
     manifold: Manifold,
     n_topics: int,
     n_iters: int = 30,
@@ -1414,7 +1414,7 @@ def step6_final_deconvolution(
     """
     start_time = time.perf_counter()
     n_slices = len(slices)
-    n_hvg = len(hvg_pack.hvg_names)
+    n_odg = len(odg_pack.odg_names)
     n_seeds = max(1, int(n_seeds))
     print(f"Step 6: LDA fit, K={n_topics}   ({n_slices} slice{'s' if n_slices > 1 else ''}, n_seeds={n_seeds})")
 
@@ -1422,7 +1422,7 @@ def step6_final_deconvolution(
     per_slice_thetas_lda: Dict[str, np.ndarray] = {}
     per_slice_stability: Dict[str, float] = {}
     for name in slices.keys():
-        X = hvg_pack.hvg_per_slice[name]
+        X = odg_pack.odg_per_slice[name]
         if n_seeds == 1:
             print(f"   [{name}] LDA on {X.shape[0]} spots (single seed)")
             lda = LatentDirichletAllocation(
@@ -1506,15 +1506,15 @@ def step6_final_deconvolution(
 
         print(f"Step 6: per-slice theta refit (variational E-step, max_iter={e_step_iters})")
         for name, sd in slices.items():
-            X = hvg_pack.hvg_per_slice[name]
+            X = odg_pack.odg_per_slice[name]
             theta = _variational_e_step(X, beta_consensus, alpha=doc_topic_prior, max_iter=e_step_iters)
             sd.theta = theta
             print(f"   [{name}] theta {theta.shape}")
         # Multi-slice projection: per-slice with cosine fallback for slice-specific genes
         print("Step 6: projecting topics to full genes_clean per slice")
         inter_index = {g: i for i, g in enumerate(manifold.intersected_genes)}
-        hvg_idx_in_intersected = manifold.hvg_indices_in_intersected
-        hvg_coords_manifold = manifold.embedding[hvg_idx_in_intersected]
+        odg_idx_in_intersected = manifold.odg_indices_in_intersected
+        odg_coords_manifold = manifold.embedding[odg_idx_in_intersected]
 
         per_slice_betas_full: Dict[str, np.ndarray] = {}
         for name, sd in slices.items():
@@ -1523,18 +1523,18 @@ def step6_final_deconvolution(
             beta_full = np.zeros((n_topics, n_genes_s))
 
             slice_gene_to_idx = {g: i for i, g in enumerate(genes_s)}
-            hvg_idx_in_slice = [slice_gene_to_idx[g] for g in hvg_pack.hvg_names]
+            odg_idx_in_slice = [slice_gene_to_idx[g] for g in odg_pack.odg_names]
 
             norm_all = normalize(sd.counts_clean.T, axis=1)
-            norm_hvg = normalize(sd.counts_clean[:, hvg_idx_in_slice].T, axis=1)
-            sim_full = norm_all @ norm_hvg.T
+            norm_odg = normalize(sd.counts_clean[:, odg_idx_in_slice].T, axis=1)
+            sim_full = norm_all @ norm_odg.T
 
             for i, g in enumerate(genes_s):
                 sim_row = sim_full[i].toarray().flatten() if sp.issparse(sim_full) else sim_full[i]
                 if g in inter_index:
                     gi = inter_index[g]
                     g_pos = manifold.embedding[gi]
-                    dists = np.linalg.norm(hvg_coords_manifold - g_pos, axis=1)
+                    dists = np.linalg.norm(odg_coords_manifold - g_pos, axis=1)
                     neighbors = np.argsort(dists)[:k_neighbors]
                 else:
                     neighbors = np.argsort(-sim_row)[:k_neighbors]
@@ -1557,17 +1557,17 @@ def step6_final_deconvolution(
         topic_dict = {}
         for k in range(n_topics):
             top_idx = log2fc_consensus[k].argsort()[::-1][:15]
-            topic_dict[f"Topic_{k}"] = [hvg_pack.hvg_names[i] for i in top_idx]
+            topic_dict[f"Topic_{k}"] = [odg_pack.odg_names[i] for i in top_idx]
         qc_df = pd.DataFrame(topic_dict)
     else:
         # Single-slice path mirrors the legacy codeconv Step 6: LDA fit_transform
-        # gives theta and beta_hvg, then a single cdist-based projection extends
+        # gives theta and beta_odg, then a single cdist-based projection extends
         # beta to the full genes_clean. QC table is built from the projected beta_final.
         only_name = next(iter(slices.keys()))
         sd = slices[only_name]
         sd.theta = per_slice_thetas_lda[only_name]
-        beta_hvg = per_slice_betas_unaligned[only_name]
-        beta_consensus = beta_hvg
+        beta_odg = per_slice_betas_unaligned[only_name]
+        beta_consensus = beta_odg
         print(f"   [{only_name}] theta {sd.theta.shape}")
 
         print("Step 6: projecting latent topics using UMAP manifold topology")
@@ -1578,16 +1578,16 @@ def step6_final_deconvolution(
         # the intersected set (intersection of one set is itself), so all genes have
         # manifold coordinates.
         inter_index = {g: i for i, g in enumerate(manifold.intersected_genes)}
-        hvg_coords_manifold = manifold.embedding[manifold.hvg_indices_in_intersected]
+        odg_coords_manifold = manifold.embedding[manifold.odg_indices_in_intersected]
         all_coords = manifold.embedding[[inter_index[g] for g in genes_s]]
-        dist_matrix = cdist(all_coords, hvg_coords_manifold, metric='euclidean')
+        dist_matrix = cdist(all_coords, odg_coords_manifold, metric='euclidean')
 
         # Cosine similarity in expression space
         slice_gene_to_idx = {g: i for i, g in enumerate(genes_s)}
-        hvg_idx_in_slice = [slice_gene_to_idx[g] for g in hvg_pack.hvg_names]
+        odg_idx_in_slice = [slice_gene_to_idx[g] for g in odg_pack.odg_names]
         norm_all = normalize(sd.counts_clean.T, axis=1)
-        norm_hvg = normalize(sd.counts_clean[:, hvg_idx_in_slice].T, axis=1)
-        similarity = norm_all @ norm_hvg.T
+        norm_odg = normalize(sd.counts_clean[:, odg_idx_in_slice].T, axis=1)
+        similarity = norm_all @ norm_odg.T
 
         beta_final = np.zeros((n_topics, n_genes_s))
         for i in range(n_genes_s):
@@ -1596,7 +1596,7 @@ def step6_final_deconvolution(
             weights = sim_row[umap_neighbors_idx]
             if np.max(weights) < min_sim:
                 continue
-            proj = beta_hvg[:, umap_neighbors_idx] @ weights
+            proj = beta_odg[:, umap_neighbors_idx] @ weights
             if proj.sum() > 0:
                 beta_final[:, i] = proj / proj.sum()
 
@@ -1617,7 +1617,7 @@ def step6_final_deconvolution(
     print(f"Step 6 done in {duration:.2f}s")
     return Model(
         n_topics=n_topics,
-        hvg_names=list(hvg_pack.hvg_names),
+        odg_names=list(odg_pack.odg_names),
         beta_consensus=beta_consensus,
         qc_df=qc_df,
         per_slice_betas=per_slice_betas_full,
