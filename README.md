@@ -55,5 +55,6 @@ The notebook guides you through the 9-step pipeline:
 
 Each slice's output folder contains a `filtered_feature_bc_matrix.h5` and a `spatial` folder. You can load each slice directly into Seurat using `Load10X_Spatial()`, e.g. via the `Seurat Spatial.ipynb` notebook to perform clustering or cell-cell communication analysis as if you had single-cell resolution. Topic identities are aligned across slices, so cluster comparison across samples is meaningful.
 
-![Figure 6 copy](https://github.com/user-attachments/assets/7dab151f-4c59-408b-88a0-689b108b5e95)
+<img width="6944" height="10416" alt="Figure 5" src="https://github.com/user-attachments/assets/9211382e-002c-441c-91a2-971d9f207b48" />
+
 (**a**) UMAP projection of Visium spot-level transcriptomes before deconvolution. (**b**) Spatial mapping of these clusters onto the histological section. (**c**) Dot plot of representative marker genes. (**d**) UMAP projection following computational deconvolution. (**e**) Spatial distribution of deconvolved cells. (**f**) Dot plot of marker genes of the deconvolved cell populations.
