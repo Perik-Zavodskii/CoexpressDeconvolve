@@ -22,6 +22,8 @@ import re
 import json
 import shutil
 import time
+import warnings
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, Union, List, Dict
 
@@ -33,11 +35,13 @@ try:
     import matplotlib.pyplot as plt
     import seaborn as sns
     from tqdm.notebook import tqdm
-    from sklearn.decomposition import FastICA, LatentDirichletAllocation
+    from sklearn.decomposition import FastICA, LatentDirichletAllocation, PCA
     from sklearn.preprocessing import StandardScaler, normalize
+    from sklearn.neighbors import NearestNeighbors
     from scipy.spatial.distance import cdist
     from scipy.optimize import linear_sum_assignment
     from scipy.special import digamma, polygamma
+    from scipy.stats import mannwhitneyu
     import h5py
     import umap
 except ImportError as e:
@@ -99,11 +103,18 @@ class OdgPack:
 
 @dataclass
 class Manifold:
-    """Output of Step 4. Joint manifold on intersected genes."""
+    """Output of Step 4. Joint manifold on intersected genes.
+
+    ``embedding`` is the 2D UMAP layout (visualization only). ``ica_coords`` is
+    the higher-dimensional ICA feature matrix (genes x n_components) that the
+    manifold was built from; Step 6 uses it for the projection k-NN because 2D
+    UMAP distances are not quantitatively meaningful.
+    """
     embedding: np.ndarray
     intersected_genes: List[str]
     odg_indices_in_intersected: List[int]
     species: str
+    ica_coords: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -544,6 +555,479 @@ def _topic_log2fc(beta: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     total = beta.sum(axis=0, keepdims=True)
     mean_other = (total - beta) / (K - 1)
     return np.log2((beta + eps) / (mean_other + eps))
+
+
+# Denoise (Step 7 optional GEX clean-up) helpers.
+#
+# A de novo, Seurat-mimicking clustering + marker pass on the generated cells,
+# used to strip "bleed" of cluster-specific marker genes out of cells that don't
+# belong to that gene's cluster(s) and reassign those UMIs back to the cells that
+# do. No scanpy: every step below is implemented directly. The reassignment is a
+# full transfer restricted to WITHIN EACH SPOT: for a specific marker gene, all of
+# its UMIs in that spot's non-home cells are pooled and handed to that spot's
+# home-cluster cells. If a spot has no home-cluster cell, those UMIs are discarded
+# ("to trash") rather than moved to another spot — the count is never fabricated
+# in a location where it was not measured. Per-gene totals are therefore conserved
+# or reduced at the spot level, never inflated. Non-marker genes are untouched.
+
+def _bh_adjust(p: np.ndarray) -> np.ndarray:
+    """Benjamini-Hochberg FDR adjustment of a p-value vector."""
+    p = np.asarray(p, dtype=float)
+    n = len(p)
+    if n == 0:
+        return p
+    order = np.argsort(p)
+    ranked = p[order] * n / (np.arange(n) + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    out = np.empty(n)
+    out[order] = np.clip(ranked, 0.0, 1.0)
+    return out
+
+
+def _sc_normalize(counts: sp.csr_matrix, scale_factor: float = 1e4) -> sp.csr_matrix:
+    """Seurat LogNormalize: log1p(count / library_size * scale_factor)."""
+    counts = counts.tocsr().astype(np.float64)
+    lib = np.asarray(counts.sum(axis=1)).flatten()
+    lib[lib == 0] = 1.0
+    norm = counts.copy()
+    norm.data /= np.repeat(lib, np.diff(norm.indptr))
+    norm.data *= scale_factor
+    norm.data = np.log1p(norm.data)
+    return norm
+
+
+def _sc_hvg(counts: sp.csr_matrix, n_hvg: int) -> np.ndarray:
+    """Seurat vst variable-feature selection.
+
+    Fit a quadratic trend of log10(variance) ~ log10(mean) on raw counts,
+    standardize each gene against its expected SD (clipped at sqrt(N)), and rank
+    genes by the variance of the standardized values.
+    """
+    counts = counts.tocsc().astype(np.float64)
+    n_cells, n_genes = counts.shape
+    mean = np.asarray(counts.mean(axis=0)).flatten()
+    sq = counts.copy(); sq.data **= 2
+    mean_sq = np.asarray(sq.mean(axis=0)).flatten()
+    var = np.maximum(mean_sq - mean ** 2, 0.0) * (n_cells / max(n_cells - 1, 1))
+    std_var = np.zeros(n_genes)
+    not_const = var > 0
+    if int(not_const.sum()) > 3:
+        coeffs = np.polyfit(np.log10(mean[not_const]), np.log10(var[not_const]), 2)
+        pos = mean > 0
+        expected_sd = np.zeros(n_genes)
+        expected_sd[pos] = np.sqrt(10 ** np.polyval(coeffs, np.log10(mean[pos])))
+        valid = pos & (expected_sd > 0)
+        clip_max = np.sqrt(n_cells)
+
+        # Fully vectorized standardized-variance: map each stored (nonzero) value
+        # to its gene column, standardize + clip, and sum-of-squares per gene via
+        # bincount; add the zero-entry contribution analytically.
+        n_nz = np.diff(counts.indptr)                       # nonzeros per gene (CSC)
+        gene_of_nz = np.repeat(np.arange(n_genes), n_nz)
+        sd_nz = expected_sd[gene_of_nz]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z_nz = (counts.data - mean[gene_of_nz]) / sd_nz
+        z_nz = np.clip(z_nz, None, clip_max)
+        z_nz = np.where(np.isfinite(z_nz), z_nz, 0.0)
+        sumsq_nz = np.bincount(gene_of_nz, weights=z_nz ** 2, minlength=n_genes)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z_zero = np.clip((0.0 - mean) / expected_sd, None, clip_max)
+        z_zero = np.where(valid, z_zero, 0.0)
+        ss = sumsq_nz + (n_cells - n_nz) * (z_zero ** 2)
+        std_var = np.where(valid, ss / max(n_cells - 1, 1), 0.0)
+    order = np.argsort(std_var)[::-1]
+    return order[:min(n_hvg, n_genes)]
+
+
+def _sc_scale(lognorm: sp.csr_matrix, hvg_idx: np.ndarray, clip: float = 10.0) -> np.ndarray:
+    """Seurat ScaleData: z-score each variable gene, clip at +/- clip."""
+    sub = lognorm[:, hvg_idx].toarray()
+    mu = sub.mean(axis=0)
+    sd = sub.std(axis=0); sd[sd == 0] = 1.0
+    return np.clip((sub - mu) / sd, -clip, clip)
+
+
+def _sc_pca(scaled: np.ndarray, n_pcs: int, seed: int) -> np.ndarray:
+    n_pcs = max(1, min(n_pcs, min(scaled.shape) - 1))
+    return PCA(n_components=n_pcs, random_state=seed).fit_transform(scaled)
+
+
+def _sc_snn(coords: np.ndarray, k: int, prune: float = 1.0 / 15.0) -> sp.csr_matrix:
+    """Shared-nearest-neighbour graph with Jaccard edge weights (Seurat-style)."""
+    n = coords.shape[0]
+    k = min(k, n)
+    nn = NearestNeighbors(n_neighbors=k).fit(coords)
+    knn = nn.kneighbors_graph(coords, mode='connectivity').astype(bool).astype(np.float64)
+    inter = (knn @ knn.T).tocoo()
+    jac = inter.data / (2 * k - inter.data)
+    snn = sp.coo_matrix((jac, (inter.row, inter.col)), shape=(n, n)).tocsr()
+    snn.setdiag(0.0); snn.eliminate_zeros()
+    snn.data[snn.data < prune] = 0.0; snn.eliminate_zeros()
+    return snn.maximum(snn.T)
+
+
+def _louvain(adj: sp.csr_matrix, resolution: float = 1.0, seed: int = 42,
+             max_levels: int = 20) -> np.ndarray:
+    """Modularity Louvain with an RB resolution parameter. Self-contained.
+
+    Higher resolution penalises large communities, yielding more clusters
+    (matching Seurat's FindClusters resolution semantics). Returns a compact
+    integer label per original node.
+    """
+    rng = np.random.default_rng(seed)
+    adj = adj.tocsr().astype(np.float64)
+    n0 = adj.shape[0]
+    orig_to_cur = np.arange(n0)  # original node -> node index in current graph
+
+    cur = adj
+    for _level in range(max_levels):
+        n = cur.shape[0]
+        deg = np.asarray(cur.sum(axis=1)).flatten()
+        m = deg.sum() / 2.0
+        if m == 0:
+            break
+        comm = np.arange(n)
+        comm_tot = deg.copy()
+        indptr, indices, data = cur.indptr, cur.indices, cur.data
+
+        improved_any = False
+        improved = True
+        while improved:
+            improved = False
+            for i in rng.permutation(n):
+                ci = comm[i]
+                ki = deg[i]
+                s, e = indptr[i], indptr[i + 1]
+                comm_w = defaultdict(float)
+                for j, wij in zip(indices[s:e], data[s:e]):
+                    if j != i:
+                        comm_w[comm[j]] += wij
+                comm_tot[ci] -= ki  # pull i out of its community
+                best_c = ci
+                # RB modularity gain: k_{i,in} - gamma * Sigma_tot * k_i / (2m).
+                best_gain = comm_w.get(ci, 0.0) - resolution * ki * comm_tot[ci] / (2.0 * m)
+                for c, wic in comm_w.items():
+                    gain = wic - resolution * ki * comm_tot[c] / (2.0 * m)
+                    if gain > best_gain + 1e-12:
+                        best_gain = gain
+                        best_c = c
+                comm[i] = best_c
+                comm_tot[best_c] += ki
+                if best_c != ci:
+                    improved = True
+                    improved_any = True
+
+        uniq, comm_new = np.unique(comm, return_inverse=True)  # compact labels
+        orig_to_cur = comm_new[orig_to_cur]
+        if not improved_any or uniq.shape[0] == n:
+            break
+        nc = uniq.shape[0]
+        row = comm_new[np.repeat(np.arange(n), np.diff(indptr))]
+        col = comm_new[indices]
+        cur = sp.coo_matrix((data, (row, col)), shape=(nc, nc)).tocsr()
+
+    _, labels = np.unique(orig_to_cur, return_inverse=True)
+    return labels
+
+
+def _sc_find_markers(lognorm: sp.csr_matrix, labels: np.ndarray, min_pct: float,
+                     logfc: float, padj_thresh: float, label: str = ""):
+    """FindAllMarkers analogue (Wilcoxon rank-sum, one-vs-rest).
+
+    For each cluster, pre-filter genes by pct.1 >= min_pct and avg log2FC >= logfc
+    (Seurat's min.pct / logfc.threshold gates), run a tie-corrected Wilcoxon
+    rank-sum on the survivors, BH-adjust, and keep genes with padj < padj_thresh.
+
+    Returns
+    -------
+    gene_to_home : dict{gene_idx -> set(cluster labels)}
+        Every cluster for which the gene passed as an up-regulated marker.
+    cluster_marker_profiles : dict{cluster -> (mean expm1 vector over all genes)}
+        Used for the donor/home similarity QC flag.
+    """
+    lognorm = lognorm.tocsc()
+    n_cells, n_genes = lognorm.shape
+    clusters = np.unique(labels)
+    binary = (lognorm > 0)
+    expm = lognorm.copy(); expm.data = np.expm1(expm.data)
+    gene_to_home = defaultdict(set)
+    cluster_profile = {}
+    for c in tqdm(clusters, desc=f"   [{label}] markers", unit="cluster", leave=False):
+        in_c = labels == c
+        n_in = int(in_c.sum()); n_out = n_cells - n_in
+        cluster_profile[int(c)] = np.asarray(expm[in_c].mean(axis=0)).flatten()
+        if n_in < 3 or n_out < 3:
+            continue
+        pct1 = np.asarray(binary[in_c].sum(axis=0)).flatten() / n_in
+        m1 = cluster_profile[int(c)]
+        m2 = np.asarray(expm[~in_c].mean(axis=0)).flatten()
+        log2fc = np.log2(m1 + 1.0) - np.log2(m2 + 1.0)
+        cand = np.where((pct1 >= min_pct) & (log2fc >= logfc))[0]
+        if cand.size == 0:
+            continue
+        # Vectorized tie-corrected Wilcoxon rank-sum over all candidate genes at
+        # once (normal approximation), replacing the per-gene Python loop.
+        Dc = lognorm[:, cand].toarray()
+        with np.errstate(all='ignore'):
+            res = mannwhitneyu(Dc[in_c], Dc[~in_c], axis=0,
+                               alternative='two-sided', method='asymptotic')
+        pvals = np.asarray(res.pvalue, dtype=float)
+        pvals = np.where(np.isfinite(pvals), pvals, 1.0)
+        padj = _bh_adjust(pvals)
+        for g in cand[padj < padj_thresh]:
+            gene_to_home[int(g)].add(int(c))
+    return gene_to_home, cluster_profile
+
+
+def _sc_reassign(counts: sp.csr_matrix, labels: np.ndarray, spot_ids: np.ndarray,
+                 gene_to_home: dict, seed: int, label: str = ""):
+    """Within-spot full-transfer UMI reassignment of bled marker genes.
+
+    Home clusters for each gene are defined globally (from the slice-wide marker
+    call), but every UMI move is confined to the spot the cell came from:
+
+      For each specific marker gene and each spot, pool that gene's UMIs sitting
+      in the spot's non-home cells. If the spot contains home-cluster cell(s),
+      redistribute the pool across them by a multinomial weighted by each cell's
+      existing expression of the gene (uniform if all zero) — expression mass
+      already encodes the per-cluster share when several home clusters coexist in
+      the spot. If the spot has no home-cluster cell, the pooled UMIs are
+      DISCARDED, not relocated to another spot.
+
+    This never fabricates counts in a spot that did not measure them; per-gene
+    totals are conserved or reduced per spot, never inflated. Non-marker genes
+    are left untouched.
+
+    Returns (cleaned_csr, umis_moved, umis_discarded, genes_cleaned).
+    """
+    rng = np.random.RandomState(seed)
+    counts = counts.tocsc().astype(np.int64)
+    labels = np.asarray(labels)
+    spot_ids = np.asarray(spot_ids)
+    n_all = np.unique(labels).shape[0]
+    n_cells, n_genes = counts.shape
+
+    # spot -> array of cell row indices (built once).
+    spot_to_cells: Dict[int, list] = defaultdict(list)
+    for i, s in enumerate(spot_ids):
+        spot_to_cells[int(s)].append(i)
+    spot_to_cells = {s: np.asarray(v) for s, v in spot_to_cells.items()}
+
+    moved_total = 0
+    discarded_total = 0
+    genes_cleaned = 0
+    discarded_per_spot: Dict[int, int] = defaultdict(int)
+
+    # Modified columns are stashed as sparse triplets and the whole matrix is
+    # rebuilt ONCE at the end. In-place CSC column assignment is O(nnz) per gene
+    # (it rebuilds the index arrays on every call) and was ~96% of the runtime;
+    # stashing avoids it entirely. RNG usage and iteration order are unchanged, so
+    # the output is bit-identical to the in-place version, just far faster.
+    changed_mask = np.zeros(n_genes, dtype=bool)
+    new_rows: List[np.ndarray] = []
+    new_cols: List[np.ndarray] = []
+    new_data: List[np.ndarray] = []
+
+    for g, home in tqdm(gene_to_home.items(), total=len(gene_to_home),
+                        desc=f"   [{label}] de-bleed", unit="gene", leave=False):
+        home = set(home)
+        if len(home) == 0 or len(home) == n_all:
+            continue  # not specific / expressed everywhere -> nothing bleeds
+        col = counts.getcol(int(g)).toarray().flatten().astype(np.int64)
+        home_mask = np.isin(labels, list(home))
+        # Only spots that actually hold bled UMIs of this gene need visiting.
+        donor_cells = np.where((~home_mask) & (col > 0))[0]
+        if donor_cells.size == 0:
+            continue
+        touched = False
+        for s in np.unique(spot_ids[donor_cells]):
+            cells = spot_to_cells[int(s)]
+            spot_home = home_mask[cells]
+            donor_local = cells[~spot_home]
+            pool = int(col[donor_local].sum())
+            if pool == 0:
+                continue
+            col[donor_local] = 0  # strip bled UMIs from this spot's wrong cells
+            recip = cells[spot_home]
+            if recip.size == 0:
+                discarded_total += pool  # no target population in this spot
+                discarded_per_spot[int(s)] += pool
+                touched = True
+                continue
+            w = col[recip].astype(np.float64)
+            if w.sum() == 0:
+                w = np.ones(recip.size)
+            col[recip] += rng.multinomial(pool, w / w.sum())
+            moved_total += pool
+            touched = True
+        if touched:
+            nz = np.flatnonzero(col)
+            new_rows.append(nz)
+            new_cols.append(np.full(nz.shape[0], int(g), dtype=np.int64))
+            new_data.append(col[nz])
+            changed_mask[int(g)] = True
+            genes_cleaned += 1
+
+    # Rebuild once: keep every original entry whose column was NOT modified, then
+    # append the stashed entries for the modified columns. O(nnz), done a single
+    # time instead of once per gene.
+    col_of_nz = np.repeat(np.arange(n_genes), np.diff(counts.indptr))
+    keep = ~changed_mask[col_of_nz]
+    rows = np.concatenate([counts.indices[keep]] + new_rows)
+    cols = np.concatenate([col_of_nz[keep]] + new_cols)
+    data = np.concatenate([counts.data[keep]] + new_data)
+    cleaned = sp.csr_matrix((data, (rows, cols)), shape=(n_cells, n_genes))
+    return cleaned, moved_total, discarded_total, dict(discarded_per_spot), genes_cleaned
+
+
+def _plot_denoise_drop(spot_before: np.ndarray, spot_dropped: np.ndarray, label: str):
+    """Two-panel denoise diagnostic.
+
+    Left: distribution over spots of the percentage of a spot's UMIs discarded
+    by the clean-up (only spots that held UMIs are shown). Right: overall share
+    of total UMIs retained vs dropped across the whole slice.
+    """
+    spot_before = np.asarray(spot_before, dtype=float)
+    spot_dropped = np.asarray(spot_dropped, dtype=float)
+    has_umi = spot_before > 0
+    pct_per_spot = np.zeros_like(spot_before)
+    pct_per_spot[has_umi] = 100.0 * spot_dropped[has_umi] / spot_before[has_umi]
+
+    total_before = spot_before.sum()
+    total_dropped = spot_dropped.sum()
+    pct_dropped = 100.0 * total_dropped / max(total_before, 1.0)
+    pct_retained = 100.0 - pct_dropped
+    n_spots_hit = int((spot_dropped > 0).sum())
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), dpi=100)
+
+    ax = axes[0]
+    vals = pct_per_spot[has_umi]
+    ax.hist(vals, bins=40, color='#e74c3c', edgecolor='black', alpha=0.75)
+    if vals.size:
+        ax.axvline(float(np.mean(vals)), color='black', linestyle='--',
+                   linewidth=1.5, label=f'mean {np.mean(vals):.2f}%')
+        ax.axvline(float(np.median(vals)), color='navy', linestyle=':',
+                   linewidth=1.5, label=f'median {np.median(vals):.2f}%')
+        ax.legend()
+    ax.set_xlabel('% of spot UMIs dropped')
+    ax.set_ylabel('# spots')
+    ax.set_title(f'[{label}] per-spot UMI drop distribution\n'
+                 f'{n_spots_hit}/{int(has_umi.sum())} spots affected')
+    ax.grid(alpha=0.3)
+
+    ax2 = axes[1]
+    bars = ax2.bar(['Retained', 'Dropped'], [pct_retained, pct_dropped],
+                   color=['#27ae60', '#e74c3c'], edgecolor='black', width=0.6)
+    for b, v in zip(bars, [pct_retained, pct_dropped]):
+        ax2.text(b.get_x() + b.get_width() / 2, v + 1.0, f'{v:.2f}%',
+                 ha='center', fontweight='bold')
+    ax2.set_ylabel('% of total UMIs')
+    ax2.set_ylim(0, 105)
+    ax2.set_title(f'[{label}] overall UMI retained vs dropped\n'
+                  f'{int(total_before - total_dropped):,} kept / {int(total_dropped):,} dropped')
+    ax2.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def _denoise_matrix(counts: sp.csr_matrix, spot_ids: np.ndarray, min_pct: float,
+                    logfc: float, resolution: float, n_hvg: int, n_pcs: int,
+                    k_neighbors: int, padj_thresh: float, seed: int,
+                    label: str = "", make_plot: bool = True) -> tuple:
+    """Orchestrate the Step 7 GEX clean-up on one slice's cell x gene matrix.
+
+    ``spot_ids`` gives the source spot index of each cell (row); UMI moves are
+    confined to within a spot. Returns (cleaned_csr, qc_dict).
+    """
+    n_cells = counts.shape[0]
+    if n_cells < 10:
+        return counts.tocsr(), {'skipped': 'too few cells', 'n_cells': n_cells}
+
+    print(f"   [{label}] denoise: log-normalizing...")
+    lognorm = _sc_normalize(counts)
+    print(f"   [{label}] denoise: finding variable genes (vst)...")
+    hvg = _sc_hvg(counts, n_hvg)
+    print(f"   [{label}] denoise: scaling...")
+    scaled = _sc_scale(lognorm, hvg)
+    print(f"   [{label}] denoise: computing PCA ({n_pcs} components)...")
+    pca = _sc_pca(scaled, n_pcs, seed)
+    print(f"   [{label}] denoise: building SNN graph (k={k_neighbors})...")
+    snn = _sc_snn(pca, k_neighbors)
+    print(f"   [{label}] denoise: clustering (Louvain, res={resolution})...")
+    labels = _louvain(snn, resolution=resolution, seed=seed)
+    n_clusters = int(np.unique(labels).size)
+    print(f"   [{label}] denoise: {n_clusters} clusters found")
+
+    if n_clusters < 2:
+        return counts.tocsr(), {'n_clusters': n_clusters, 'umis_moved': 0,
+                                'genes_cleaned': 0,
+                                'note': 'single cluster; nothing to de-bleed'}
+
+    print(f"   [{label}] denoise: finding markers (Wilcoxon, one-vs-rest)...")
+    gene_to_home, cluster_profile = _sc_find_markers(
+        lognorm, labels, min_pct=min_pct, logfc=logfc, padj_thresh=padj_thresh, label=label
+    )
+    n_specific = sum(1 for h in gene_to_home.values() if 0 < len(h) < n_clusters)
+    print(f"   [{label}] denoise: reassigning bled UMIs within spots...")
+    cleaned, moved, discarded, discarded_per_spot, genes_cleaned = _sc_reassign(
+        counts, labels, spot_ids, gene_to_home, seed, label=label
+    )
+
+    # Per-spot UMI accounting for the drop diagnostic.
+    spot_ids = np.asarray(spot_ids, dtype=np.int64)
+    row_tot = np.asarray(counts.sum(axis=1)).flatten()
+    spot_before = np.bincount(spot_ids, weights=row_tot).astype(np.int64)
+    spot_dropped = np.zeros_like(spot_before)
+    for s, v in discarded_per_spot.items():
+        spot_dropped[int(s)] += int(v)
+    total_before = int(spot_before.sum())
+    pct_dropped = 100.0 * discarded / max(total_before, 1)
+    pct_retained = 100.0 - pct_dropped
+
+    # QC: flag cluster pairs whose expression profiles correlate highly (>0.9) —
+    # the clean-up may be collapsing genuine subclusters there. Correlation is
+    # computed on the variable genes (HVGs) only: on the full gene set the shared
+    # background makes almost every pair look ~1.0, which is uninformative.
+    prof_ids = sorted(cluster_profile.keys())
+    similar_pairs = []
+    if len(prof_ids) > 1:
+        P = np.vstack([cluster_profile[c] for c in prof_ids])[:, hvg]
+        with np.errstate(invalid='ignore'):
+            corr = np.corrcoef(P)
+        for a in range(len(prof_ids)):
+            for b in range(a + 1, len(prof_ids)):
+                if np.isfinite(corr[a, b]) and corr[a, b] > 0.9:
+                    similar_pairs.append((prof_ids[a], prof_ids[b], round(float(corr[a, b]), 3)))
+    if similar_pairs:
+        print(f"   [{label}] denoise QC: {len(similar_pairs)} highly-correlated cluster "
+              f"pair(s) (r>0.9) — check for subcluster collapse: {similar_pairs}")
+
+    _, sizes = np.unique(labels, return_counts=True)
+    qc = {
+        'n_clusters': n_clusters,
+        'cluster_sizes': sizes.tolist(),
+        'n_specific_genes': int(n_specific),
+        'genes_cleaned': int(genes_cleaned),
+        'umis_moved': int(moved),
+        'umis_discarded': int(discarded),
+        'umis_total_before': total_before,
+        'pct_umi_retained': round(pct_retained, 4),
+        'pct_umi_dropped': round(pct_dropped, 4),
+        'umis_per_spot_before': spot_before.tolist(),
+        'umis_dropped_per_spot': spot_dropped.tolist(),
+        'labels': labels.tolist(),
+        'similar_cluster_pairs': similar_pairs,
+    }
+    print(f"   [{label}] denoise: {moved} UMIs reassigned within-spot, "
+          f"{discarded} discarded (no in-spot target) across {genes_cleaned} "
+          f"marker genes ({n_specific} specific of {len(gene_to_home)} markers)")
+    print(f"   [{label}] denoise: UMI retained {pct_retained:.2f}% / dropped {pct_dropped:.2f}% "
+          f"({(spot_dropped > 0).sum()} spots affected)")
+    if make_plot:
+        _plot_denoise_drop(spot_before, spot_dropped, label)
+    return cleaned, qc
 
 
 # STEP 1: load
@@ -1110,6 +1594,7 @@ def step4_gene_manifold(
         intersected_genes=manifold_genes,
         odg_indices_in_intersected=odg_indices_in_intersected,
         species=species,
+        ica_coords=X_ica,
     )
 
 
@@ -1230,7 +1715,7 @@ def step5_ksweep(
                 learning_offset=50.,
                 max_iter=5,
                 random_state=_SEED,
-                n_jobs=-1,
+                n_jobs=1,  # deterministic: fixed E-step chunking across machines
                 doc_topic_prior=doc_topic_prior,
                 topic_word_prior=topic_word_prior,
             )
@@ -1430,7 +1915,7 @@ def step6_final_deconvolution(
                 learning_method='batch',
                 max_iter=n_iters,
                 random_state=_SEED,
-                n_jobs=-1,
+                n_jobs=1,  # deterministic: fixed E-step chunking across machines
                 verbose=0,
                 doc_topic_prior=doc_topic_prior,
                 topic_word_prior=topic_word_prior,
@@ -1450,7 +1935,7 @@ def step6_final_deconvolution(
                     learning_method='batch',
                     max_iter=n_iters,
                     random_state=_SEED + i,
-                    n_jobs=-1,
+                    n_jobs=1,  # deterministic: fixed E-step chunking across machines
                     verbose=0,
                     doc_topic_prior=doc_topic_prior,
                     topic_word_prior=topic_word_prior,
@@ -1510,11 +1995,15 @@ def step6_final_deconvolution(
             theta = _variational_e_step(X, beta_consensus, alpha=doc_topic_prior, max_iter=e_step_iters)
             sd.theta = theta
             print(f"   [{name}] theta {theta.shape}")
-        # Multi-slice projection: per-slice with cosine fallback for slice-specific genes
-        print("Step 6: projecting topics to full genes_clean per slice")
+        # Multi-slice projection: neighbors in ICA space (cosine), with an
+        # expression-cosine fallback for slice-specific genes absent from the joint
+        # manifold. UMAP embedding is not used here (2D layout, non-metric).
+        print("Step 6: projecting topics to full genes_clean per slice (ICA-space cosine k-NN)")
         inter_index = {g: i for i, g in enumerate(manifold.intersected_genes)}
         odg_idx_in_intersected = manifold.odg_indices_in_intersected
-        odg_coords_manifold = manifold.embedding[odg_idx_in_intersected]
+        odg_ica = manifold.ica_coords[odg_idx_in_intersected]
+        odg_ica_norm = np.linalg.norm(odg_ica, axis=1)
+        odg_ica_norm[odg_ica_norm == 0] = 1.0
 
         per_slice_betas_full: Dict[str, np.ndarray] = {}
         for name, sd in slices.items():
@@ -1532,10 +2021,10 @@ def step6_final_deconvolution(
             for i, g in enumerate(genes_s):
                 sim_row = sim_full[i].toarray().flatten() if sp.issparse(sim_full) else sim_full[i]
                 if g in inter_index:
-                    gi = inter_index[g]
-                    g_pos = manifold.embedding[gi]
-                    dists = np.linalg.norm(odg_coords_manifold - g_pos, axis=1)
-                    neighbors = np.argsort(dists)[:k_neighbors]
+                    g_vec = manifold.ica_coords[inter_index[g]]
+                    gn = np.linalg.norm(g_vec) or 1.0
+                    cos = (odg_ica @ g_vec) / (odg_ica_norm * gn)
+                    neighbors = np.argsort(-cos)[:k_neighbors]
                 else:
                     neighbors = np.argsort(-sim_row)[:k_neighbors]
 
@@ -1570,17 +2059,19 @@ def step6_final_deconvolution(
         beta_consensus = beta_odg
         print(f"   [{only_name}] theta {sd.theta.shape}")
 
-        print("Step 6: projecting latent topics using UMAP manifold topology")
+        print("Step 6: projecting latent topics using ICA manifold topology (cosine k-NN)")
         genes_s = sd.genes_clean
         n_genes_s = len(genes_s)
 
-        # Manifold positions: for a single slice, every gene in genes_clean is in
-        # the intersected set (intersection of one set is itself), so all genes have
-        # manifold coordinates.
+        # Neighbors are found in the ICA feature space (cosine distance), NOT in the
+        # 2D UMAP embedding: the UMAP layout is for visualization and does not
+        # preserve quantitative distances, whereas the ICA coordinates are the space
+        # the manifold was actually built from. For a single slice every gene in
+        # genes_clean is in the intersected set, so all have ICA coordinates.
         inter_index = {g: i for i, g in enumerate(manifold.intersected_genes)}
-        odg_coords_manifold = manifold.embedding[manifold.odg_indices_in_intersected]
-        all_coords = manifold.embedding[[inter_index[g] for g in genes_s]]
-        dist_matrix = cdist(all_coords, odg_coords_manifold, metric='euclidean')
+        odg_coords_manifold = manifold.ica_coords[manifold.odg_indices_in_intersected]
+        all_coords = manifold.ica_coords[[inter_index[g] for g in genes_s]]
+        dist_matrix = cdist(all_coords, odg_coords_manifold, metric='cosine')
 
         # Cosine similarity in expression space
         slice_gene_to_idx = {g: i for i, g in enumerate(genes_s)}
@@ -1591,12 +2082,12 @@ def step6_final_deconvolution(
 
         beta_final = np.zeros((n_topics, n_genes_s))
         for i in range(n_genes_s):
-            umap_neighbors_idx = np.argsort(dist_matrix[i])[:k_neighbors]
+            neighbor_idx = np.argsort(dist_matrix[i])[:k_neighbors]
             sim_row = similarity[i].toarray().flatten() if sp.issparse(similarity) else similarity[i]
-            weights = sim_row[umap_neighbors_idx]
+            weights = sim_row[neighbor_idx]
             if np.max(weights) < min_sim:
                 continue
-            proj = beta_odg[:, umap_neighbors_idx] @ weights
+            proj = beta_odg[:, neighbor_idx] @ weights
             if proj.sum() > 0:
                 beta_final[:, i] = proj / proj.sum()
 
@@ -1633,12 +2124,23 @@ def step7_sampling_engine(
     config_path: str,
     species: str,
     low_slice_quality=False,
-    min_topic_percentage: Optional[float] = None,
+    min_topic_percentage: Optional[float] = 0.0,
+    denoise: bool = False,
+    denoise_min_pct: float = 0.25,
+    denoise_logfc: float = 1.0,
+    denoise_resolution: float = 0.5,
+    denoise_n_hvg: int = 2000,
+    denoise_n_pcs: int = 30,
+    denoise_k: int = 20,
+    denoise_padj: float = 0.05,
+    denoise_plot: bool = True,
 ) -> Dict[str, dict]:
     """Per-slice hierarchical Bayesian sampling. Returns dict of per-slice cell outputs.
 
-    Threshold-and-renormalize is always applied: any topic with theta < min_topic_percentage
-    is zeroed and theta is renormalized. low_slice_quality=True per slice additionally
+    Threshold-and-renormalize: any topic with theta < min_topic_percentage is
+    zeroed and theta is renormalized. Default is 0.0 (no thresholding); pass a
+    value > 0 to prune minor topics per spot, or pass None to fall back to the
+    config's ``min_topic_percentage``. low_slice_quality=True per slice additionally
     enforces an inflate rescue: every surviving topic gets at least 1 cell.
 
     The inner gene-and-cell allocation is vectorized via a sequential-binomial
@@ -1647,6 +2149,36 @@ def step7_sampling_engine(
     will not be bit-for-bit identical to the legacy implementation under the
     same seed. The marginals (per-spot UMI conservation, per-cell topic
     assignment, gamma cell weights) are preserved.
+
+    Optional GEX clean-up (denoise)
+    -------------------------------
+    When ``denoise=True``, each slice's generated cell x gene matrix is put
+    through a de novo Seurat-style pass — LogNormalize, vst variable features,
+    scale, PCA, SNN graph, Louvain clustering, and a Wilcoxon FindAllMarkers
+    analogue — and then *cleaned*. Marker clusters are defined slice-wide, but the
+    UMI reassignment is confined to within each spot: for every cluster-specific
+    marker gene, its UMIs sitting in a spot's non-home cells are pooled and handed
+    to that same spot's home-cluster cells (multinomial weighted by existing
+    expression). If a spot has no home-cluster cell, those pooled UMIs are
+    DISCARDED rather than moved to another spot, so nothing is fabricated in a
+    location that never measured it. Non-marker genes are untouched; per-gene
+    totals are conserved-or-reduced per spot, never inflated. The returned
+    ``matrix`` for the slice is the cleaned matrix (there is no separate raw
+    copy); a ``denoise_qc`` entry with cluster labels, UMIs moved/discarded, and a
+    subcluster-collapse warning is attached to the slice payload.
+
+    Parameters
+    ----------
+    denoise : bool
+        Master toggle for the clean-up. Default False (raw generated matrix).
+    denoise_min_pct, denoise_logfc, denoise_resolution : float
+        Seurat min.pct, logfc.threshold (log2), and FindClusters resolution.
+        Defaults 0.25 / 1.0 / 0.5.
+    denoise_n_hvg, denoise_n_pcs, denoise_k : int
+        Variable-feature count, PCA dimensions, and kNN neighbours for the SNN
+        graph. Defaults 2000 / 30 / 20.
+    denoise_padj : float
+        BH-adjusted p-value cutoff for a gene to count as a cluster marker.
     """
     start_time = time.perf_counter()
     profile = _load_config(config_path, species)
@@ -1799,11 +2331,31 @@ def step7_sampling_engine(
 
         final_matrix = sp.csr_matrix((data, (rows, cols)), shape=(global_cell_idx, n_genes))
         print(f"   [{name}] generated {global_cell_idx} cells   rescued {n_rescued} topic slots")
+
+        denoise_qc = None
+        if denoise:
+            spot_ids = np.array([m['spot_idx'] for m in cell_metadata], dtype=np.int64)
+            final_matrix, denoise_qc = _denoise_matrix(
+                final_matrix,
+                spot_ids,
+                min_pct=denoise_min_pct,
+                logfc=denoise_logfc,
+                resolution=denoise_resolution,
+                n_hvg=denoise_n_hvg,
+                n_pcs=denoise_n_pcs,
+                k_neighbors=denoise_k,
+                padj_thresh=denoise_padj,
+                seed=_SEED,
+                label=name,
+                make_plot=denoise_plot,
+            )
+
         out[name] = {
             'matrix': final_matrix,
             'cell_metadata': cell_metadata,
             'n_cells': global_cell_idx,
             'n_rescued': n_rescued,
+            'denoise_qc': denoise_qc,
         }
 
     duration = time.perf_counter() - start_time
@@ -1930,6 +2482,17 @@ def step9_export_results(
             'n_rescued_topic_slots': int(payload.get('n_rescued', 0)),
             'gene_count_export': int(len(genes)),
         }
+        dqc = payload.get('denoise_qc')
+        if dqc:
+            slice_summary['denoise'] = {
+                'n_clusters': dqc.get('n_clusters'),
+                'genes_cleaned': dqc.get('genes_cleaned'),
+                'umis_moved': dqc.get('umis_moved'),
+                'umis_discarded': dqc.get('umis_discarded'),
+                'pct_umi_retained': dqc.get('pct_umi_retained'),
+                'pct_umi_dropped': dqc.get('pct_umi_dropped'),
+                'similar_cluster_pairs': dqc.get('similar_cluster_pairs'),
+            }
         with open(os.path.join(slice_dir, "run_summary.json"), 'w') as fout:
             json.dump(slice_summary, fout, indent=2)
         summary[name] = slice_summary
