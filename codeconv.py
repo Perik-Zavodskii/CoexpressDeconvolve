@@ -2395,7 +2395,11 @@ def step8_geometry_and_placement(
 
             cy = sd.coords[s, 0]
             cx = sd.coords[s, 1]
-            r = diameter * np.sqrt(idx) / np.sqrt(n_total) if n_total > 1 else 0
+            # Vogel sunflower confined to the spot footprint: the max radius is the
+            # spot radius (diameter / 2), NOT the diameter — otherwise cells reach a
+            # full diameter out and overlap neighbouring spots. (idx + 0.5) / n gives
+            # an area-uniform fill of the disk.
+            r = 0.5 * diameter * np.sqrt((idx + 0.5) / n_total) if n_total > 1 else 0.0
             ang = idx * phi_golden
             py = cy + r * np.sin(ang)
             px = cx + r * np.cos(ang)
