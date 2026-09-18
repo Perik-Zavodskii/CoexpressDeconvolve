@@ -160,12 +160,6 @@ Config Maker (`Estimate single cell parameters.ipynb`) computes them from a fold
 datasets for the target organism. Add organism-specific `qc_markers` and `noise_regex` to the same
 block so the gene manifold is annotated.
 
-### Large count tables
-
-A dense text matrix is streamed line by line into a sparse matrix rather than loaded whole, and the
-result is cached next to the source as `<file>.codeconv_cache.npz`. A 1.8 GB table parses once in
-about two minutes and reloads in under a second. Delete the cache file to force a re-parse.
-
 ## The 9 steps
 
 1. **Acquisition** - detect the platform, load counts and coordinates, per-spot UMI QC.
@@ -210,12 +204,6 @@ features only.
 <img width="6944" height="10416" alt="Figure 5" src="https://github.com/user-attachments/assets/9211382e-002c-441c-91a2-971d9f207b48" />
 
 (**a**) UMAP projection of Visium spot-level transcriptomes before deconvolution. (**b**) Spatial mapping of these clusters onto the histological section. (**c**) Dot plot of representative marker genes. (**d**) UMAP projection following computational deconvolution. (**e**) Spatial distribution of deconvolved cells. (**f**) Dot plot of marker genes of the deconvolved cell populations.
-
-## Reproducibility
-
-`codeconv.set_seed(42)` fixes every stochastic stage: the LDA fits, the consensus seeds, the sampler
-and the placement. The same input and the same seed give the same cells. `run_summary.json` records
-what was run, so a result can be traced back to its parameters without the notebook.
 
 ## Citation
 
