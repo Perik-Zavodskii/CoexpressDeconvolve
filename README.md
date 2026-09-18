@@ -59,7 +59,22 @@ Python 3.9 or newer. Dependency versions are pinned by the package, so there is 
 manage. Human (`hs`) and mouse (`mm`) species profiles are built into the module, so a fresh install
 runs with no further downloads.
 
-## Usage
+## Usage - The 9 steps
+
+1. **Acquisition** - detect the platform, load counts and coordinates, per-spot UMI QC.
+2. **Density** - cells per spot from a hybrid housekeeping/UMI calibration. `low_slice_quality=True`
+   enforces a floor of one cell on every spot passing the UMI gate.
+3. **Feature selection** - noise-gene regex, presence filter, overdispersed genes from the
+   mean-variance trend.
+4. **Manifold** - joint gene co-expression topology via ICA + UMAP.
+5. **K-sweep** - held-out perplexity across K, rare-topic counts, automatic recommendation.
+6. **Deconvolution** - per-slice LDA, Hungarian topic alignment across slices, mean-consensus beta,
+   per-slice theta refit against the frozen consensus, projection onto each slice's full gene list.
+7. **Sampling** - discrete cells drawn per spot; per-spot UMI totals are conserved exactly. Topics
+   below `min_topic_percentage` are zeroed and renormalized; `low_slice_quality=True` rescues every
+   surviving topic with at least one cell, to keep rare programs in weak spots.
+8. **Placement** - cells positioned inside their parent spot footprint by Vogel packing.
+9. **Export** - 10x layout under `output_folder/slice_<name>/deconvolved/`, one folder per slice.
 
 `CoexpressDeconvolve.ipynb` in this repository runs the whole pipeline on a Visium slide and is the
 quickest way in. The same thing in plain Python:
@@ -159,23 +174,6 @@ To derive `hk_profiles` and the engine parameters from data rather than by hand,
 Config Maker (`Estimate single cell parameters.ipynb`) computes them from a folder of 10x scRNA-seq
 datasets for the target organism. Add organism-specific `qc_markers` and `noise_regex` to the same
 block so the gene manifold is annotated.
-
-## The 9 steps
-
-1. **Acquisition** - detect the platform, load counts and coordinates, per-spot UMI QC.
-2. **Density** - cells per spot from a hybrid housekeeping/UMI calibration. `low_slice_quality=True`
-   enforces a floor of one cell on every spot passing the UMI gate.
-3. **Feature selection** - noise-gene regex, presence filter, overdispersed genes from the
-   mean-variance trend.
-4. **Manifold** - joint gene co-expression topology via ICA + UMAP.
-5. **K-sweep** - held-out perplexity across K, rare-topic counts, automatic recommendation.
-6. **Deconvolution** - per-slice LDA, Hungarian topic alignment across slices, mean-consensus beta,
-   per-slice theta refit against the frozen consensus, projection onto each slice's full gene list.
-7. **Sampling** - discrete cells drawn per spot; per-spot UMI totals are conserved exactly. Topics
-   below `min_topic_percentage` are zeroed and renormalized; `low_slice_quality=True` rescues every
-   surviving topic with at least one cell, to keep rare programs in weak spots.
-8. **Placement** - cells positioned inside their parent spot footprint by Vogel packing.
-9. **Export** - 10x layout under `output_folder/slice_<name>/deconvolved/`, one folder per slice.
 
 ## Downstream analysis
 
