@@ -59,7 +59,7 @@ Python 3.9 or newer. Dependency versions are pinned by the package, so there is 
 manage. Human (`hs`) and mouse (`mm`) species profiles are built into the module, so a fresh install
 runs with no further downloads.
 
-## Usage - The 9 steps
+## Usage
 
 1. **Acquisition** - detect the platform, load counts and coordinates, per-spot UMI QC.
 2. **Density** - cells per spot from a hybrid housekeeping/UMI calibration. `low_slice_quality=True`
