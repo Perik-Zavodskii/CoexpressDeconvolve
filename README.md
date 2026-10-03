@@ -61,6 +61,21 @@ runs with no further downloads.
 
 ## Usage
 
+1. **Acquisition** - detect the platform, load counts and coordinates, per-spot UMI QC.
+2. **Density** - cells per spot from a hybrid housekeeping/UMI calibration. `low_slice_quality=True`
+   enforces a floor of one cell on every spot passing the UMI gate.
+3. **Feature selection** - noise-gene regex, presence filter, overdispersed genes from the
+   mean-variance trend.
+4. **Manifold** - joint gene co-expression topology via ICA + UMAP.
+5. **K-sweep** - held-out perplexity across K, rare-topic counts, automatic recommendation.
+6. **Deconvolution** - per-slice LDA, Hungarian topic alignment across slices, mean-consensus beta,
+   per-slice theta refit against the frozen consensus, projection onto each slice's full gene list.
+7. **Sampling** - discrete cells drawn per spot; per-spot UMI totals are conserved exactly. Topics
+   below `min_topic_percentage` are zeroed and renormalized; `low_slice_quality=True` rescues every
+   surviving topic with at least one cell, to keep rare programs in weak spots.
+8. **Placement** - cells positioned inside their parent spot footprint by Vogel packing.
+9. **Export** - 10x layout under `output_folder/slice_<name>/deconvolved/`, one folder per slice.
+
 `CoexpressDeconvolve.ipynb` in this repository runs the whole pipeline on a Visium slide and is the
 quickest way in. The same thing in plain Python:
 
@@ -160,29 +175,6 @@ Config Maker (`Estimate single cell parameters.ipynb`) computes them from a fold
 datasets for the target organism. Add organism-specific `qc_markers` and `noise_regex` to the same
 block so the gene manifold is annotated.
 
-### Large count tables
-
-A dense text matrix is streamed line by line into a sparse matrix rather than loaded whole, and the
-result is cached next to the source as `<file>.codeconv_cache.npz`. A 1.8 GB table parses once in
-about two minutes and reloads in under a second. Delete the cache file to force a re-parse.
-
-## The 9 steps
-
-1. **Acquisition** - detect the platform, load counts and coordinates, per-spot UMI QC.
-2. **Density** - cells per spot from a hybrid housekeeping/UMI calibration. `low_slice_quality=True`
-   enforces a floor of one cell on every spot passing the UMI gate.
-3. **Feature selection** - noise-gene regex, presence filter, overdispersed genes from the
-   mean-variance trend.
-4. **Manifold** - joint gene co-expression topology via ICA + UMAP.
-5. **K-sweep** - held-out perplexity across K, rare-topic counts, automatic recommendation.
-6. **Deconvolution** - per-slice LDA, Hungarian topic alignment across slices, mean-consensus beta,
-   per-slice theta refit against the frozen consensus, projection onto each slice's full gene list.
-7. **Sampling** - discrete cells drawn per spot; per-spot UMI totals are conserved exactly. Topics
-   below `min_topic_percentage` are zeroed and renormalized; `low_slice_quality=True` rescues every
-   surviving topic with at least one cell, to keep rare programs in weak spots.
-8. **Placement** - cells positioned inside their parent spot footprint by Vogel packing.
-9. **Export** - 10x layout under `output_folder/slice_<name>/deconvolved/`, one folder per slice.
-
 ## Downstream analysis
 
 Each slice exports a `filtered_feature_bc_matrix.h5` and a `spatial/` folder, alongside a
@@ -210,12 +202,6 @@ features only.
 <img width="6944" height="10416" alt="Figure 5" src="https://github.com/user-attachments/assets/9211382e-002c-441c-91a2-971d9f207b48" />
 
 (**a**) UMAP projection of Visium spot-level transcriptomes before deconvolution. (**b**) Spatial mapping of these clusters onto the histological section. (**c**) Dot plot of representative marker genes. (**d**) UMAP projection following computational deconvolution. (**e**) Spatial distribution of deconvolved cells. (**f**) Dot plot of marker genes of the deconvolved cell populations.
-
-## Reproducibility
-
-`codeconv.set_seed(42)` fixes every stochastic stage: the LDA fits, the consensus seeds, the sampler
-and the placement. The same input and the same seed give the same cells. `run_summary.json` records
-what was run, so a result can be traced back to its parameters without the notebook.
 
 ## Citation
 
